@@ -7,3 +7,4 @@ yarn.lock
 agent-manager.json
 .wrangler/
 *.bat
+build/out/

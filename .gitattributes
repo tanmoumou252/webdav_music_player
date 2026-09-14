@@ -1,0 +1,14 @@
+# 行尾统一：仓库内文本文件一律 LF（配合字节相等棘轮，防止 CRLF 漂移）
+* text=auto
+
+# 文本源码、脚本与文档：检出即 LF，不受 core.autocrlf 影响
+src/*.part.js text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+
+# 字节精确基线：禁止任何换行转换（须置于通用规则之后，后匹配者覆盖）
+/worker.js -text
+golden/* -text
