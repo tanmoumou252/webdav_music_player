@@ -35,6 +35,8 @@ test("buildShareHeadHtml: escaped OG/Twitter head", () => {
   assert.ok(html.includes('<meta property="og:type" content="music.song">'));
   assert.ok(html.includes('<meta property="og:url" content="https://app.example.com/?play=a1b2c3d4">'));
   assert.ok(html.includes('<meta name="twitter:card" content="summary">'));
+  assert.ok(html.includes('<meta name="twitter:title" content="Artist - Title | 站点">'), "song card restores twitter:title parity with og:title");
+  assert.ok(html.includes('<meta name="twitter:description" content="Artist - Title · 站点">'), "song card restores twitter:description parity with og:description");
   assert.ok(html.includes('<meta property="og:description" content="Artist - Title · 站点">'));
   assert.ok(html.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'));
   assert.ok(html.includes('<meta name="twitter:image" content="https://app.example.com/og-icon.png">'));
@@ -55,6 +57,8 @@ test("buildShareHeadHtml: escaped OG/Twitter head", () => {
   const genericStays = P.buildShareHeadHtml("https://app.example.com/", "", "站点", "a1b2c3d4");
   assert.ok(genericStays.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'), "generic card ignores coverId");
   assert.ok(genericStays.includes('<meta property="og:site_name" content="站点">'), "generic card keeps site name");
+  assert.ok(genericStays.includes('<meta name="twitter:title" content="站点">'), "generic card carries twitter:title");
+  assert.ok(genericStays.includes('<meta name="twitter:description" content="站点 · 多源 WebDAV 音乐库">'), "generic card carries twitter:description");
   const fallback = P.buildShareHeadHtml("https://app.example.com/?play=a1b2c3d4", "Artist - Title.mp3", "站点");
   assert.ok(fallback.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'), "three-arg call keeps the static icon contract");
   assert.ok(fallback.includes('<meta property="og:description" content="Artist - Title · 站点">'), "three-arg call keeps description");
@@ -562,4 +566,15 @@ test("record tool: freshness is byte-identity, never mtime", async () => {
   const src = readFileSync(join(root, "test", "tools", "record.mjs"), "utf8");
   assert.ok(src.includes("Buffer.compare(stitched, built)"), "recorder must compare the concatenated src bytes with the artifact");
   assert.ok(!src.includes("mtimeMs"), "recorder must not judge freshness by clock metadata");
+});
+
+test("build.mjs --verify-staged audits the git index, not only the working tree", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { join } = await import("node:path");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const src = readFileSync(join(root, "build.mjs"), "utf8");
+  assert.ok(src.includes("if (VERIFY_STAGED) {"), "verify-staged branch must exist");
+  assert.ok(src.includes('["ls-files", "--cached", "-z", "--", "src"]'), "verify-staged must enumerate the staged src/*.part.js set via git ls-files");
+  assert.ok(src.includes('["show", ":" + name]'), "verify-staged must read and compare each staged blob via git show :<path>");
 });

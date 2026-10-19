@@ -10,8 +10,8 @@ function compactTemplate(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-const GOLDEN_SHA256 = "be9a9f4ba4d8370a04d9b5923202cf006d4e5590a4149640cb01dd959fae1680";
-const GOLDEN_LENGTH = 106632;
+const GOLDEN_SHA256 = "faab0632f604f309f781bb7ed69ce2ebf7882a14a85278275edf0ac6f5780c7a";
+const GOLDEN_LENGTH = 107173;
 
 test("Tier-3 renderHTML snapshot: golden length & sha256 master", () => {
   const html = renderHTML();
@@ -108,6 +108,9 @@ test("Tier-3 playback resilience lock: heartbeat watchdog, resume and tag cache 
   assert.ok(html.includes("waitingForGesture = true;"));
   assert.ok(html.includes("pendingSeek = lastKnownProgress(song);"));
   assert.ok(html.includes("const PROGRESS_STORE_KEY = 'webdav_player_progress_v1';"));
+  assert.ok(html.includes("if (pendingSeek === null) pendingSeek = lastKnownProgress(song);"), "tryPlayFromNode:1415 backfill must stay — recoverPlayback:1740 next-mirror resume depends solely on it");
+  assert.ok(html.includes("function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false, resume = false) {"), "startPlayback must carry the trailing resume param after isAuto (guards A-9 形参序漂移)");
+  assert.ok(html.includes("forgetProgress(song);"), "the active-start (resume=false) branch must forget progress, not merely null pendingSeek");
   assert.ok(html.includes("let tagCache = new Map();"));
   assert.ok(html.includes("async function parseAndCacheTags(song, url, token)"));
   assert.ok(

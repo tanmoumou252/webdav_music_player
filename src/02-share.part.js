@@ -133,6 +133,8 @@ function buildShareHeadHtml(requestUrl, name, siteTitle, coverId) {
       "<meta property=\"og:type\" content=\"website\">" +
       "<meta property=\"og:title\" content=\"" + genericTitle + "\">" +
       "<meta property=\"og:description\" content=\"" + genericDesc + "\">" +
+      "<meta name=\"twitter:title\" content=\"" + genericTitle + "\">" +
+      "<meta name=\"twitter:description\" content=\"" + genericDesc + "\">" +
       "<meta property=\"og:url\" content=\"" + safeUrl + "\">" +
       imageTags;
   }
@@ -145,6 +147,8 @@ function buildShareHeadHtml(requestUrl, name, siteTitle, coverId) {
     "<meta property=\"og:type\" content=\"music.song\">" +
     "<meta property=\"og:title\" content=\"" + safeTitle + "\">" +
     "<meta property=\"og:description\" content=\"" + safeDesc + "\">" +
+    "<meta name=\"twitter:title\" content=\"" + safeTitle + "\">" +
+    "<meta name=\"twitter:description\" content=\"" + safeDesc + "\">" +
     "<meta property=\"og:url\" content=\"" + safeUrl + "\">" +
     imageTags;
 }

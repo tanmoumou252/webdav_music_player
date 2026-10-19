@@ -83,6 +83,22 @@ if (VERIFY_STAGED) {
   const goldenAuditPath = join(ROOT, "golden", "worker.head.mjs");
   const builtAuditPath = join(ROOT, "build", "out", "worker.check.mjs");
   const auditIssues = [];
+  try {
+    const stagedSrc = execFileSync("git", ["ls-files", "--cached", "-z", "--", "src"], { cwd: ROOT })
+      .toString("utf8").split("\u0000").filter((n) => n.endsWith(".part.js")).sort();
+    const diskSrc = partFiles.map((n) => "src/" + n).sort();
+    if (stagedSrc.join("\u0001") !== diskSrc.join("\u0001")) {
+      auditIssues.push("the staged src/*.part.js set differs from the parts concatenated for this audit — git add the new/renamed parts");
+    } else {
+      for (const name of stagedSrc.concat(["worker.js", "golden/worker.head.mjs"])) {
+        const expected = name.startsWith("src/") ? readFileSync(join(ROOT, name)) : assembled;
+        const staged = execFileSync("git", ["show", ":" + name], { cwd: ROOT, maxBuffer: 16 * 1024 * 1024 });
+        if (Buffer.compare(staged, expected) !== 0) auditIssues.push(name + " in the git index differs from the audited bytes — git add it before committing");
+      }
+    }
+  } catch (e) {
+    auditIssues.push("cannot audit the git index: " + String((e && e.message) || e));
+  }
   const diskWorker = existsSync(workerPath) ? readFileSync(workerPath) : null;
   if (!diskWorker) auditIssues.push("worker.js is missing on disk");
   else if (Buffer.compare(diskWorker, assembled) !== 0) auditIssues.push("worker.js on disk diverges from the current src concat — stale: run `node build.mjs --record` first");

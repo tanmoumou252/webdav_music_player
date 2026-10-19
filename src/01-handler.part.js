@@ -15,7 +15,9 @@ async function resolveSharedSongName(env, playId) {
       const found = pickShareIndexName(pairs, normPlayId);
       if (found) return found;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error("resolveSharedSongName failed for", normPlayId, e);
+  }
   return null;
 }
 

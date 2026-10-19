@@ -23,6 +23,26 @@ for (const s of scenarios()) {
   });
 }
 
+test("share head: a throwing MUSIC_KV is swallowed fail-closed AND logged", async () => {
+  const req = makeRequest({ method: "GET", url: PAGE_URL + "/?play=a1b2c3d4" });
+  const boomEnv = { MUSIC_KV: { get: async () => { throw new Error("kv-down"); } } };
+  let logged = null;
+  const orig = console.error;
+  console.error = (...a) => { logged = a; };
+  let res;
+  let err;
+  try {
+    res = await worker.fetch(req, boomEnv);
+  } catch (e) {
+    err = e;
+  } finally {
+    console.error = orig;
+  }
+  assert.equal(err, undefined, "a KV fault must not escape the page render");
+  assert.equal(res.status, 200, "a KV fault falls back to the generic card, never a 500");
+  assert.ok(logged !== null, "the swallowed fault must be logged (silent under an empty catch)");
+});
+
 test("coverage: golden records and scenarios are in exact 1:1 correspondence", () => {
   const names = scenarios().map((s) => s.name);
   for (const name of names) {

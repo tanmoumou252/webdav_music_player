@@ -15,7 +15,9 @@ async function resolveSharedSongName(env, playId) {
       const found = pickShareIndexName(pairs, normPlayId);
       if (found) return found;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error("resolveSharedSongName failed for", normPlayId, e);
+  }
   return null;
 }
 
@@ -706,6 +708,8 @@ function buildShareHeadHtml(requestUrl, name, siteTitle, coverId) {
       "<meta property=\"og:type\" content=\"website\">" +
       "<meta property=\"og:title\" content=\"" + genericTitle + "\">" +
       "<meta property=\"og:description\" content=\"" + genericDesc + "\">" +
+      "<meta name=\"twitter:title\" content=\"" + genericTitle + "\">" +
+      "<meta name=\"twitter:description\" content=\"" + genericDesc + "\">" +
       "<meta property=\"og:url\" content=\"" + safeUrl + "\">" +
       imageTags;
   }
@@ -718,6 +722,8 @@ function buildShareHeadHtml(requestUrl, name, siteTitle, coverId) {
     "<meta property=\"og:type\" content=\"music.song\">" +
     "<meta property=\"og:title\" content=\"" + safeTitle + "\">" +
     "<meta property=\"og:description\" content=\"" + safeDesc + "\">" +
+    "<meta name=\"twitter:title\" content=\"" + safeTitle + "\">" +
+    "<meta name=\"twitter:description\" content=\"" + safeDesc + "\">" +
     "<meta property=\"og:url\" content=\"" + safeUrl + "\">" +
     imageTags;
 }
@@ -2437,7 +2443,7 @@ function renderHTML() {
       syncPlaylistCurrentLocate();
 
       if (matchedIndex !== -1) {
-        playTrackByIndex(matchedIndex, true);
+        playTrackByIndex(matchedIndex, true, true);
       }
     }
 
@@ -2468,16 +2474,16 @@ function renderHTML() {
       syncPlaylistCurrentLocate();
     }
 
-    function playTrackByIndex(idx, isAuto = false) {
+    function playTrackByIndex(idx, isAuto = false, resume = false) {
       if (idx < 0 || idx >= currentPlaylist.length) return;
       clearError();
       currentIndex = idx;
       updateSidebarActive(idx);
       const song = currentPlaylist[idx];
-      startPlayback(song, 0, true, isAuto);
+      startPlayback(song, 0, true, isAuto, resume);
     }
 
-    function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false) {
+    function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false, resume = false) {
       playToken = playToken + 1;
       resetCoverAmbient();
       if (tagAbort) tagAbort.abort();
@@ -2499,7 +2505,12 @@ function renderHTML() {
         } catch (e) {}
       }
       document.getElementById('cover').src = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' fill='%231f1f1f'><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='%237c7c7c' font-size='12'>读取中</text></svg>";
-      pendingSeek = lastKnownProgress(song);
+      if (resume) {
+        pendingSeek = lastKnownProgress(song);
+      } else {
+        forgetProgress(song);
+        pendingSeek = null;
+      }
 
       resumeAutoScroll();
 
@@ -2814,6 +2825,19 @@ function renderHTML() {
       lastPersistAt = now;
       try {
         sessionStorage.setItem(PROGRESS_STORE_KEY, JSON.stringify({ key: key, time: time, at: now }));
+      } catch (e) {}
+    }
+
+    function forgetProgress(song) {
+      const key = songKey(song);
+      if (key === null) return;
+      progressMemory.delete(key);
+      try {
+        const raw = sessionStorage.getItem(PROGRESS_STORE_KEY);
+        if (raw) {
+          const rec = JSON.parse(raw);
+          if (rec && rec.key === key) sessionStorage.removeItem(PROGRESS_STORE_KEY);
+        }
       } catch (e) {}
     }
 

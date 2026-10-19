@@ -145,6 +145,25 @@ const CLEANUP_RE = /stopStallHeartbeat\(\);\s*stallRetries\s*=\s*0;\s*pendingSee
 // the full async flow, not just the synchronous prefix of tryPlayFromNode.
 const flushMicrotasks = () => new Promise((r) => setTimeout(r, 0));
 
+test("active playback start forgets remembered progress and never resumes", () => {
+  const { T } = runClient(extractClientScript());
+  T.startPlayback(SONG, 0, false, false);
+  T.audio.paused = false; T.audio.readyState = 4; T.audio.currentTime = 40;
+  T.fireTimeUpdate();
+  T.startPlayback(SONG, 0, false, false);
+  assert.equal(T.getState().pendingSeek, null, "a default (active-click) start must clear pendingSeek, never resume from remembered progress");
+});
+
+test("refresh-located start keeps remembered progress", async () => {
+  const { T } = runClient(extractClientScript());
+  T.startPlayback(SONG, 0, false, false);
+  T.audio.paused = false; T.audio.readyState = 4; T.audio.currentTime = 40;
+  T.fireTimeUpdate();
+  T.startPlayback(SONG, 0, false, false, true);
+  assert.equal(T.getState().pendingSeek, 40, "the resume=true (refresh/深链) start must resume from remembered progress");
+  await flushMicrotasks();
+});
+
 test("client watchdog: the exhausted branch actually clears the stall heartbeat interval", async () => {
   const { T, timers } = runClient(extractClientScript());
   T.startStallHeartbeat();
