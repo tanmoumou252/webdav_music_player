@@ -1,10 +1,10 @@
 # npm install -g wrangler
 # wrangler dev
 
-name = "webdav-music-player"
+name = "webdav-music"
 main = "worker.js"
 compatibility_date = "2026-09-01"
 
 [[kv_namespaces]]
 binding = "MUSIC_KV"
-id = "d41d8cd98f00b204e9800998ecf8427e"
+id = "ccd2e2a68b074c6a850bb908d3507358"

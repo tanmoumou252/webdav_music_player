@@ -82,3 +82,5 @@ export const davResponse = (xml, status = 207, statusText = "Multi-Status", cont
   () => new Response(xml, { status, statusText, headers: { "content-type": contentType } });
 
 export const jsmediatagsBody = "/* jsmediatags 3.9.5 fake payload */";
+
+export const RANGE_BODY_500 = "0123456789".repeat(50);

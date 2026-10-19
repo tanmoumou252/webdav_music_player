@@ -78,7 +78,7 @@ export function redactRecord(rec) {
     status: rec.status,
     statusText: rec.statusText,
     headers: {},
-    body: rec.body === undefined ? undefined : redact(rec.body),
+    body: rec.body === undefined ? undefined : (typeof rec.body === "string" ? redact(rec.body) : rec.body),
   };
   for (const [k, v] of Object.entries(rec.headers || {})) {
     out.headers[k] = Array.isArray(v) ? v.map(redact) : redact(v);

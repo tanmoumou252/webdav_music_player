@@ -1,3 +1,24 @@
+async function resolveSharedSongName(env, playId) {
+  if (!playId || !/^[0-9a-f]{8}$/i.test(playId)) return null;
+  const normPlayId = playId.toLowerCase();
+  try {
+    const cachedPlaylist = await env.MUSIC_KV.get("cache_v3_list_all", "json");
+    const cachedSong = cachedPlaylist && Array.isArray(cachedPlaylist.items) ? cachedPlaylist.items.find(item => item && item.id === normPlayId) : null;
+    if (cachedSong && typeof cachedSong.name === "string" && cachedSong.name) {
+      return cachedSong.name;
+    }
+    const sources = (await env.MUSIC_KV.get("dav_sources", { type: "json" })) || [];
+    for (const srcEntry of sources) {
+      const indexKey = srcEntry && typeof srcEntry.id === "string" ? shareIndexSourceKey(srcEntry.id) : null;
+      if (!indexKey) continue;
+      const pairs = await env.MUSIC_KV.get(indexKey, "json");
+      const found = pickShareIndexName(pairs, normPlayId);
+      if (found) return found;
+    }
+  } catch (e) {}
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -35,6 +56,44 @@ export default {
         return new Response("// jsmediatags unavailable", {
           headers: { ...corsHeaders, "Content-Type": "application/javascript" }
         });
+      }
+    }
+
+    if (url.pathname === "/og-icon.png" || url.pathname === "/favicon.ico") {
+      return new Response(decodeOgIconPng(), {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=604800"
+        }
+      });
+    }
+
+    if (url.pathname === "/icon.svg") {
+      return new Response(OG_ICON_SVG, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "public, max-age=604800"
+        }
+      });
+    }
+
+    if (url.pathname === "/og-cover.svg") {
+      const coverId = url.searchParams.get("id") || "";
+      try {
+        const coverName = await resolveSharedSongName(env, coverId);
+        const svg = buildOgCoverSvg(coverId, coverName);
+        if (!svg) return new Response("Not Found", { status: 404, headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" } });
+        return new Response(svg, {
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "image/svg+xml; charset=utf-8",
+            "Cache-Control": "public, max-age=86400"
+          }
+        });
+      } catch (e) {
+        return new Response("Not Found", { status: 404, headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" } });
       }
     }
 
@@ -137,17 +196,30 @@ export default {
       const { sources, siteTitle, newAdminPass } = await request.json();
       if (newAdminPass && (typeof newAdminPass !== "string" || newAdminPass.length < 8)) return new Response(JSON.stringify({ error: "新密码长度至少 8 位" }), { status: 400, headers: corsHeaders });
       if (sources && !Array.isArray(sources)) return new Response(JSON.stringify({ error: "源配置格式无效" }), { status: 400, headers: corsHeaders });
-      if (sources) {
-        if (sources.some(s => !s || typeof s !== "object" || !isValidSourceUrl(s.url))) {
-          return new Response(JSON.stringify({ error: "源配置无效：url 必须为 http/https 且格式合法" }), { status: 400, headers: corsHeaders });
-        }
-        await env.MUSIC_KV.put("dav_sources", JSON.stringify(sources));
+      if (sources && sources.some(s => !s || typeof s !== "object" || !isValidSourceUrl(s.url))) {
+        return new Response(JSON.stringify({ error: "源配置无效：url 必须为 http/https 且格式合法" }), { status: 400, headers: corsHeaders });
       }
+
       if (siteTitle) await env.MUSIC_KV.put("site_title", siteTitle);
 
       const listKeys = await env.MUSIC_KV.list({ prefix: "cache_v3_list_" });
       for (const k of listKeys.keys) {
         await env.MUSIC_KV.delete(k.name);
+      }
+
+      if (sources) {
+        const oldSources = (await env.MUSIC_KV.get("dav_sources", { type: "json" })) || [];
+        await env.MUSIC_KV.put("dav_sources", JSON.stringify(sources));
+        const keptIds = new Set(sources.map(s => s && typeof s.id === "string" ? s.id : null));
+        for (const oldSrc of oldSources) {
+          const oldId = oldSrc && typeof oldSrc.id === "string" ? oldSrc.id : null;
+          if (oldId === null) continue;
+          const oldKey = shareIndexSourceKey(oldId);
+          if (oldKey === null || keptIds.has(oldId)) continue;
+          try {
+            await env.MUSIC_KV.delete(oldKey);
+          } catch (e) {}
+        }
       }
 
       const headers = new Headers(corsHeaders);
@@ -288,6 +360,22 @@ export default {
 
         if (finalItems.length > 0) {
           await env.MUSIC_KV.put(cacheKey, JSON.stringify(responsePayload), { expirationTtl: 1800 });
+          try {
+            const bySource = {};
+            for (const item of finalItems) {
+              const nodes = item && Array.isArray(item.availableNodes) ? item.availableNodes : [];
+              for (const node of nodes) {
+                if (!node || typeof node.sourceId !== "string") continue;
+                if (!bySource[node.sourceId]) bySource[node.sourceId] = [];
+                bySource[node.sourceId].push(item);
+              }
+            }
+            for (const sourceId of Object.keys(bySource)) {
+              const indexKey = shareIndexSourceKey(sourceId);
+              if (!indexKey) continue;
+              await env.MUSIC_KV.put(indexKey, JSON.stringify(normalizeShareIndexPairs(bySource[sourceId])));
+            }
+          } catch (e) {}
         }
 
         const out = { ...responsePayload };
@@ -350,8 +438,10 @@ export default {
         forwardHeaders.set("Authorization", "Basic " + btoa(unescape(encodeURIComponent(`${src.user || ""}:${src.pass || ""}`))));
       }
 
-      if (request.headers.has("Range")) {
+      const clientRange = parseSingleByteRange(request.headers.get("Range"));
+      if (clientRange) {
         forwardHeaders.set("Range", request.headers.get("Range"));
+        forwardHeaders.set("Accept-Encoding", "identity");
       }
 
       try {
@@ -359,6 +449,27 @@ export default {
           method: request.method,
           headers: forwardHeaders
         });
+
+        if (res.status === 416) {
+          const rangeRejectHeaders = new Headers(res.headers);
+          rangeRejectHeaders.set("Access-Control-Allow-Origin", "*");
+          rangeRejectHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
+          rangeRejectHeaders.set("Access-Control-Allow-Headers", "*");
+          rangeRejectHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+          if (!rangeRejectHeaders.get("Content-Range")) {
+            const rejectLength = res.headers.get("Content-Length");
+            if (rejectLength && /^\d+$/.test(rejectLength)) {
+              rangeRejectHeaders.set("Content-Range", "bytes */" + rejectLength);
+            }
+          }
+          rangeRejectHeaders.delete("Content-Length");
+          rangeRejectHeaders.delete("Accept-Ranges");
+          return new Response(null, {
+            status: 416,
+            statusText: res.statusText || "Range Not Satisfiable",
+            headers: rangeRejectHeaders
+          });
+        }
 
         if (!res.ok && res.status !== 206) {
           const bodyText = await res.text().catch(() => "");
@@ -380,7 +491,42 @@ export default {
         respHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
         respHeaders.set("Access-Control-Allow-Headers", "*");
         respHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
-        respHeaders.set("Accept-Ranges", "bytes");
+        if (!respHeaders.get("Content-Type")) {
+          const fallbackType = audioContentTypeFor(rawFile);
+          if (fallbackType) respHeaders.set("Content-Type", fallbackType);
+        }
+
+        const upstreamLengthRaw = res.headers.get("Content-Length");
+        const upstreamTotal = upstreamLengthRaw && /^\d+$/.test(upstreamLengthRaw) ? parseInt(upstreamLengthRaw, 10) : null;
+
+        if (clientRange && res.status === 200 && upstreamTotal !== null && !res.headers.get("Content-Encoding")) {
+          const clientStart = clientRange.suffix !== null ? Math.max(0, upstreamTotal - clientRange.suffix) : clientRange.start;
+          if (clientStart >= upstreamTotal) {
+            respHeaders.set("Content-Range", "bytes */" + upstreamTotal);
+            respHeaders.delete("Content-Length");
+            respHeaders.delete("Accept-Ranges");
+            return new Response(null, { status: 416, statusText: "Range Not Satisfiable", headers: respHeaders });
+          }
+          const rangeEnd = clientRange.end !== null ? Math.min(clientRange.end, upstreamTotal - 1) : upstreamTotal - 1;
+          const rangeCount = rangeEnd - clientStart + 1;
+          const sliced = sliceReadableStream(res.body, clientStart, rangeCount);
+          if (sliced) {
+            respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+            respHeaders.set("Content-Length", String(rangeCount));
+            respHeaders.set("Accept-Ranges", "bytes");
+            return new Response(sliced, { status: 206, statusText: "Partial Content", headers: respHeaders });
+          }
+          respHeaders.delete("Accept-Ranges");
+          return new Response(res.body, { status: res.status, statusText: res.statusText, headers: respHeaders });
+        }
+
+        if (res.status === 206) {
+          respHeaders.set("Accept-Ranges", "bytes");
+        }
+
+        if (clientRange && res.status === 200 && res.headers.get("Content-Encoding")) {
+          respHeaders.delete("Accept-Ranges");
+        }
 
         return new Response(res.body, {
           status: res.status,
@@ -407,18 +553,19 @@ export default {
     pageHeaders.set("Cache-Control", "no-store");
 
     const playId = url.searchParams.get("play") || url.searchParams.get("v") || url.searchParams.get("id");
+    let siteTitle = "";
+    try {
+      siteTitle = (await env.MUSIC_KV.get("site_title")) || "";
+    } catch (e) {
+      siteTitle = "";
+    }
+    const sharedSongName = await resolveSharedSongName(env, playId);
     let html = renderHTML();
-    if (playId && /^[0-9a-f]{8}$/i.test(playId)) {
-      try {
-        const normPlayId = playId.toLowerCase();
-        const siteTitle = (await env.MUSIC_KV.get("site_title")) || "";
-        const cachedPlaylist = await env.MUSIC_KV.get("cache_v3_list_all", "json");
-        const sharedSong = cachedPlaylist && Array.isArray(cachedPlaylist.items) ? cachedPlaylist.items.find(item => item && item.id === normPlayId) : null;
-        if (sharedSong) {
-          const metaHtml = buildShareHeadHtml(url.href, sharedSong.name, siteTitle);
-          html = html.replace("<title>Cloud Music Hub</title>", () => metaHtml);
-        }
-      } catch (e) {}
+    const coverId = playId && /^[0-9a-f]{8}$/i.test(playId) ? playId.toLowerCase() : null;
+    html = html.replace("<!--SHARE_HEAD-->", () => buildShareHeadHtml(url.href, sharedSongName, siteTitle, coverId));
+    if (sharedSongName) {
+      const sharedTitle = escapeHtmlText(shareTitleText(sharedSongName, siteTitle || "Cloud Music Hub"));
+      html = html.replace("<title>Cloud Music Hub</title>", () => "<title>" + sharedTitle + "</title>");
     }
     return new Response(html, { headers: pageHeaders });
   }
@@ -439,25 +586,140 @@ function escapeHtmlText(value) {
   return String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-function buildShareHeadHtml(requestUrl, name, siteTitle) {
+const OG_ICON_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAWQElEQVR4nO3dPW4cV7rHYS5BYVsSDQ4gOJhkCDhxoIAODAwcCARswIkCLsABQ4cEvAAuwIFChQy8AC5AAcMJuYRegu6tVrctU/zo7/+p8z7BE1zgWirq7eH5ddWpqoPJZHLA2o4nk8nJZDI5////+2IymVxOJpPrz0wnk8lHAFY2vfP79HL+e/Z8/nv3uIE1YNTiBzASR5PJ5HTy6cN3NZlMbhr4HwcAn34fX81/P5/Of1+n14xRiB9Ao47nlXnlWzzA6Eznv7/PnSl4WPwAGjEU45kFH6BLiyA4c4bgb/EDCC/6507nA5RzM//9XzoG4gewZ88s+gB8ZhEDzxpYowTADpzOT/+kP2gAtOtqvl6k1ywBsKHFt/3bBj5UAIzHbYWzAvED2IGj+f2iNvMBsInpfD3pcq9A/AC2vPC/a+ADA0B/3vUWAvEDsPADMCLdhED8ADYwXJu5cKofgD2bztefUe8RiB/Ams4s/ACETefrUXpNLBEAx/OXQqSHDgAL12N85HD8AJb0bL4TMz1kAHjI5ZguC8QPYAkn7uUHYCRu5+tWeu0cfQD41g/AGF02sIaOMgCOPa8fgJG7aXlvQPwA7mGHPwC9aPZOgfgB3OGBPgD06F0Da2yTAfDMKX8AOnfT0l0C8QOYXx9xyh+ACqat7AtIH4Dr/QBU08S+gPTinx4CAKREIyD1F7u/HwCCzwtI/KV2+gPA3yJ3CFj8ASBv7xFg8QeANuw1Aiz+ANCOvUXAPv4SG/4AYHl72Ri467/ArX4AsLqd3yJo8QeANu00Anb1B3u8LwBsZqePDd7FH/rM4g8AWzHd1QuEdhEA3uoHANtzM4YAcLsfAGzf1m8P3OYfZtMfAOzOVjcFbusPsukPAHZrq5sCtxUArvsDwO5tbT/ANv4QT/oDgP3ZypMCN/0DThr4hwCAak6SATDcl3jbwD8CAFRzu+nzAZz6B4Bx2uhSwLr/4XEDPzgAVLf2XQHrBsB1Az80AFR3vc8A8MAfAGjHWg8IWvU/8KIfAGjLWi8MWjUALhr4QQGAf7rYZQAc+fYPAE2aztfpnQSAN/0BQLtWemPgKt/+0z8YAPC4pc8C+PYPAP1Y+iyAb/8A0JelzgIsEwAe+QsA47HUI4Kf+n9w3z8AjMtSzwV4KgDOG/hBAIDVnG8aAF73CwDjc7tJAJw28AMAAOs5XTcArho4eABgPVfrBMCzBg4cANjMg5sBbf4DgH49uBnwoQC4aeCgAYDN3KwSAJ78BwD9uPfJgE7/A0Df7r0M4PQ/APTt3ssATv8DQP++uAxwNwDOGjhIAGC7zp4KAA//AYD+fPFQoLsB4M1/ANCf6WMBcNzAAQIAu3H8UAC4/Q8A+nX+UAC4/g8A/bp6KABc/weAfk3vCwD3/wNA/47uBsBpAwcFAOzW6d0AuGjgoACA3bq4GwA2AAJA/67uBoAXAAFA/27uBkD6gACA/fgrADwBEADqOF4EwEkDBwMA7MfJIgA8AhgA6jhfBIBbAAGgjotFAFw2cDAAwH5cLgLguoGDAQD241oAAEA9AgAACvorALwGGADqmC4CIH0gAMB+CQAAKEgAAEBBAgAAChIAAFCRAACAggQAABQkAACgIAEAAAUJAAAoSAAAQEECAAAKEgAAUJAAAICCBAAAFCQAAKAgAQAABQkAAChIAABAQQIAAAoSAABQkAAAgIIEAAAUJAAAoCABAAAFCQAAKEgAABEvfnv98ev/nZV0+P5N/N8fBAAQIQDyM6A2AQBECID8DKhNAAARAiA/A2oTAECEAMjPgNoEABAhAPIzoDYBAEQIgPwMqE0AABECID8DahMAQIQAyM+A2gQAECEA8jOgNgEARAiA/AyoTQAAEQIgPwNqEwBAhADIz4DaBAAQIQDyM6A2AQBECID8DKhNAAARAiA/A2oTAECEAMjPgNoEABAhAPIzoDYBAEQIgPwMqE0AABECID8DahMAQIQAyM+A2gQAECEA8jOgNgEARAiA/AyoTQAAEQIgPwNqEwBAhADIz4DaBAAQIQDyM6A2AQBECID8DKhNAAARAiA/A2oTAECEAMjPgNoEABAhAPIzoDYBAEQIgPwMqE0AABECID8DahMAQIQAyM+A2gQAECEA8jOgNgEARAiA/AyoTQAAEQIgPwNqEwBAhADIz4DaBAAQIQDyM6A2AQBECID8DKhNAAARAiA/A2oTAECEAMjPgNoEABAhAPIzoDYBAEQIgPwMqE0AABECID8DahMAQIQAyM+A2gQAECEA8jOgNgEARAiA/AyoTQAAEQIgPwNqEwBAhADIz4DaBAAQIQDyM6A2AQBECID8DKhNAAARAiA/A2oTAECEAMjPgNoEABAhAPIzoDYBAEQIgPwMqE0AABECID8DahMAQIQAyM+A2gQAECEA8jOgNgEARAiA/AyoTQAAEQIgPwNqEwBAhADIz4DaBAAQIQDyM6A2AQBECID8DKhNAEBQ5UVw+NnT//5QmQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAIEgA5GcAVQkACBIA+RlAVQIAggRAfgZQlQCAIAGQnwFUJQAgSADkZwBVCQAIEgD5GUBVAgCCBEB+BlCVAIAgAZCfAVQlACBIAORnAFUJAAgSAPkZQFUCAIIEQH4GUJUAgCABkJ8BVCUAYM+e//fff3l5+UN8IRYAUJMAgG16dThb2F/8+t3HF79///Hw/ZuZ9GLbIgEAWQIANvDV629mi/3LP378eHj9S3xRHRMBAFkCAFb0/Of/zE7dW/AFAIyZAIAlLBb9rz+8jS+cvRAAkCUA4AFfHf9rtkj5pi8AoEcCAO4YrutX3p0vAKAGAQBzw+59O/YFAFQhAChvONXvG78AgGoEAHW9Oiz9JL40AQBZAoCShl39NvcJAKhMAFDLq8PZQ3vSix8CANIEAGUM3/rdx98OAQBZAoAShufypxc8BAC0RADQt1eHHw///Cm+2CEAoDUCgG4ND/Rxyr9dAgCyBABdcr2/fQIAsgQA3Xl+9m18cUMAQOsEAF2x+I+HAIAsAUA3LP7jIgAgSwDQBYv/+AgAyBIAjJ7Ff5wEAGQJAEZtdqtfA4sZAgDGRgAwWu7zHzcBAFkCgHHyhL/REwCQJQAYJW/0Gz8BAFkCgNF58et38cULAQBjJwAYFZv++iEAIEsAMCqu+/dDAECWAGA0hgUjvWghAKAXAoBRcOq/PwIAsgQAo3D4/k18wUIAQE8EAM17/vN/4osVAgB6IwBo3uH1L/HFCgEAvREANM09//0SAJAlAGjXq0PP+u+YAIAsAUCz3PbXNwEAWQKAZrn23zcBAFkCgCY9P/s2vkAhAKBnAoAmeeRv/wQAZAkAmuOpfzUIAMgSADTn5eUP8cUJAQC9EwA0x61/NQgAyBIANMVjf+sQAJAlAGiK0/91CADIEgA0xen/OgQAZAkAmvH8v/+OL0oIAKhCANCMF79/H1+UEABQhQCgGR7+U4sAgCwBQBuGN/81sCghAKAKAUATXP+vRwBAlgCgCV79W48AgCwBQBNe/vFjfEFCAEAlAoAm2ABYjwCALAFAE9KLEQIAqhEAxHn9b00CALIEAHHuAKhJAECWACDuxa/fxRcjBABUIwCIcwtgTQIAsgQAcQKgJgEAWQKAuJeXP8QXIwQAVCMAiDt8/ya+GCEAoBoBQJwAqEkAQJYAIE4A1CQAIEsAECcAahIAkCUAiBMANQkAyBIAxAmAmgQAZAkA4twGWJMAgCwBQJwHAdUkACBLABAnAGoaXgKV/uxBZQKAuOdn38YXIwQAVCMAiPM64Jq+Ov5X/LMHlQkA4oaFIL0YsX/pzx1UJwBoQnoxYr8O//wp/pmD6gQATRgWhPSixP68/OPH+GcOqhMANGFYENKLEvvjFkDIEwA0wa2AtTz/+T/xzxxUJwBogjsBanEHAOQJAJqRXpTYj8PrX+KfNUAA0BAvBaphePdD+rMGCAAaYh9ADcOTH9OfNUAA0JCvXn8TX5zYvcmrw/hnDRAANObrD2/jCxS74wFA0A4BQFOG68PpRYrdefHrd/HPGPCJAKApw/3h6UWK3XH7H7RDANAclwH65PQ/tEUA0JwXv38fX6zYPrv/oS0CgOZ4PXCHPry1+x8aIwBokocC9cXDf6A9AoAm2QzYF5v/oD0CgGYNz4xPL1xsbjibk/4sAV8SADRr2DSWXrzY3PCmx/RnCfiSAKBpzgKMm2//0C4BQNOcBRg33/6hXQKA5g0PkEkvZKzu5R8/xj87wMMEAM0bvkWmFzNWZ+c/tE0AMArDt8n0gsbyXvz2Ov6ZAR4nABiF2dMBvSNgFIaNm576B+0TAIzG8CrZ9OLG02z8g3EQAIyKRwS3bXiRU/ozAixHADAqLgW0y6l/GBcBwOh4T0Cbvnr9TfyzASxPADBKw6nm9ILH34b9GenPBLAaAcBoeUBQG7zqF8ZJADBerw69KyBsiDDX/WGcBACjNlx3tikwtPjb9AejJgAYPREQ8OGtTX8wcgKALnhroMUfWI0AoBsiwOIPLE8A0BURYPEHliMA6M7s9cH2BFj8gUcJALpkY+D2DLf6DY9gTs8U2C4BQLeGRcvDgjZc/N+/casfdEoA0LdXh7Mn1aUX0jHyZj/omwCghOFZ9ekFdTQ+vJ29cCk9M2C3BABlDPsCXBJ43HDK3/V+qEEAUM6L317HF9rmfHjrjX5QjACgJGcD/uZbP9QkAChttjeg6O2Cw8t8XOuHugQAvDr8dFmgSggMp/t/e53/dweiBADMDafBZ7cM9hoCi4Xfff2AAIB7dHZGYDjVP9vgZ+EHPiMA4BHDy4WGTXLpRXwdL//40TV+4EECAJYwXB4Ynow3fJtOL+yPftv/86fZt327+oGnCABY0XAL4bDItnJmYPimb9EHViUAYBOvDmen2Yc9A7Mg2PW+gQ9vZ3/P8PcNrz2O//zAaAkA2LLhm/iwOA+L9Oyywfs3K8XBcJlh8d/M/oxfv/u02NvEB2yRAACAggQAABQkAACgIAEAAAUJAAAoSAAAQEECAAAKEgAAUJAAAICCBAAAFCQAAKAgAQAABQkAAChIAABAQQIAAAoSAABQkAAAgIIEAAAUJAAAoCABAAAFCQAAKEgAAEA9BwIAAOoRAABQkAAAgIJmATBt4EAAgP2YLgLguoGDAQD241oAAEA9AgAACvorAC4bOBgAYD8uFwFw0cDBAAD7cbEIgPMGDgYA2I/zRQCcNHAwAMB+nCwC4LiBgwEA9uN4EQCeBggAdRx8HgA3DRwQALBbN3cD4KqBgwIAduvqbgC4FRAA+ndxNwBOGzgoAGC3Tu8GwFEDBwUA7NbR3QDwWmAA6Nv0szX/HwFgIyAA9OvqoQDwSGAA6Nf5QwHgiYAA0K/jhwLAPgAA6NP0znr/RQDYBwAA/bl6KgDOGjhIAGC7zp4KAM8DAID+HD0VAF4MBAB9ublnrb83ANwOCAD9OF82AFwGAIB+fHH6/6EAcBkAAPpw7+n/xwLAZQAAGL97T/8/FgDPGjhoAGAzz1YNAA8FAoBx++LhP8sGwGkDBw8ArOd03QAY3DbwAwAAq7l9Yn1/MgBsBgSA8Xlw89+yAfDMGwIBYFSmj23+WzYABpcN/DAAwHIul1jblwoATwYEgPG498l/6wTA4F0DPxAA8Lh3S67rSweAswAA0L6lvv2vEgDOAgBA25b+9r9qABy5IwAAmjRd5dv/qgEwuGjghwQA/ulixfV85QDwXAAAaMtS9/1vGgCDswZ+WADgk7M11vK1AmBw3cAPDADVXa+5jq8dAMcN/NAAUN3xvgPgwCOCASBqqUf+7iIAnnldMABE3K6z8W9bATA4aeAfAQCqOdlw/d44AFwKAID92ujU/zYDYHDTwD8IAPTuZkvr9tYC4NgDggBgp6ab7PrfVQAceEAQAOzUWg/82UcAHHhjIADsxEpv+ksEwIH9AACwVVu77r/rAPDCIADYjrVe9JMKgAObAgFgY1vd9LevADiwKRAANrLVTX/7DAARAADr2eniv48AOPCkQABYyVae9NdCABy4PRAAlrL12/3SASACAOBxe1v89x0AIgAA7rfXxT8RACIAAP5p74t/KgAObAwEgJm9bPhrKQAO3CIIQHE7v9Wv1QBYRIAnBgJQyTS9+LcQAAceGwxAITt9vO/YAuBg/qIDbxEEoGc3u3qxz5gDYMEdAgD0KLLTf0wBcGBfAAAdaeJ6/1gC4GB+fcQlAQDG7KaV6/1jCoAFzwsAYIxi9/f3EgCDk8lkctvAMAHgKbfzdSu9dnYRAAfzXZPOBgDQssuWdvn3EgALw7WU6waGDAAL1y1f6+8lABbcKQBAWrM7/HsOgIP5aZYLIQDAnk3n689oTvf3FgALRx4gBMCevJuvO+m1TwAIAQD2oJuFv8cA+DwELl0aAGBD0/l60tXC33MALAzXZs49QwCAFd3O149RX+OvHACfO51MJlcNfKgAaNfVfL1Ir1kCYAcWZwW8ZwCAj/P1oPtv+wLgn47EAEBJi0W/y2v7AmD1GDibn/6xeRCgL9P57/ez6ov+5+IH0KjjeR0KAoDxWSz452N8RO++xA9gJI7mG0Mu5h8qlw0A2nAz/718Mf897Rv+kuIHMHLH89c+DpV5Mb9f9Pozzh4ArGd65/fp5fz37Pn8965v9huKH0BB6f9RAbQo/bu5nP8DWcRnRpNJPEIAAAAASUVORK5CYII=";
+
+const OG_ICON_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#1ed760"><path d="M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z"/></svg>';
+
+const OG_NOTE_PATH_D = "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z";
+const OG_COVER_TITLE_MAX = 22;
+const OG_COVER_ARTIST_MAX = 30;
+
+function clampOgCoverLine(value, max) {
+  const raw = String(value || "");
+  if (raw.length <= max) return raw;
+  let end = max;
+  if (end < raw.length && raw.charCodeAt(end) >= 0xdc00 && raw.charCodeAt(end) <= 0xdfff) {
+    end -= 1;
+  }
+  return raw.slice(0, end) + "…";
+}
+
+function buildOgCoverSvg(coverId, name) {
+  if (!coverId || !/^[0-9a-f]{8}$/i.test(String(coverId))) return null;
   const display = getShareDisplayParts(name);
+  if (!display.title) return null;
+  const title = escapeHtmlText(clampOgCoverLine(display.title, OG_COVER_TITLE_MAX));
+  const artistLine = display.artist ? "<text x=\"480\" y=\"360\" font-family=\"Segoe UI,sans-serif\" font-size=\"36\" fill=\"#9aa4b2\">" + escapeHtmlText(clampOgCoverLine(display.artist, OG_COVER_ARTIST_MAX)) + "</text>" : "";
+  return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"630\" viewBox=\"0 0 1200 630\">" +
+    "<defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">" +
+    "<stop offset=\"0\" stop-color=\"#0d1117\"/><stop offset=\"1\" stop-color=\"#14301b\"/></linearGradient></defs>" +
+    "<rect width=\"1200\" height=\"630\" fill=\"url(#g)\"/>" +
+    "<g transform=\"translate(120 171) scale(12)\" fill=\"#1ed760\"><path d=\"" + OG_NOTE_PATH_D + "\"/></g>" +
+    "<text x=\"480\" y=\"290\" font-family=\"Segoe UI,sans-serif\" font-size=\"56\" fill=\"#ffffff\">" + title + "</text>" +
+    artistLine +
+    "</svg>";
+}
+
+let ogIconPngBytes = null;
+
+function decodeOgIconPng() {
+  if (ogIconPngBytes) return ogIconPngBytes;
+  const binary = atob(OG_ICON_PNG_B64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  ogIconPngBytes = bytes;
+  return bytes;
+}
+
+const SHARE_INDEX_PREFIX = "share_meta_index_v1_";
+const SHARE_INDEX_MAX = 20000;
+const SHARE_NAME_MAX = 300;
+
+function shareIndexSourceKey(sourceId) {
+  const raw = String(sourceId || "").replace(/[^A-Za-z0-9_-]/g, "");
+  if (!raw) return null;
+  return SHARE_INDEX_PREFIX + raw;
+}
+
+function normalizeShareIndexPairs(items) {
+  const byId = new Map();
+  const incoming = Array.isArray(items) ? items : [];
+  for (const item of incoming) {
+    if (!item || typeof item.id !== "string" || !/^[0-9a-f]{8}$/.test(item.id)) continue;
+    if (typeof item.name !== "string" || !item.name) continue;
+    if (byId.has(item.id)) byId.delete(item.id);
+    byId.set(item.id, [item.id, item.name.slice(0, SHARE_NAME_MAX)]);
+  }
+  const out = Array.from(byId.values());
+  while (out.length > SHARE_INDEX_MAX) {
+    out.pop();
+  }
+  return out;
+}
+
+function pickShareIndexName(index, id) {
+  if (!Array.isArray(index) || typeof id !== "string" || !id) return null;
+  for (const pair of index) {
+    if (!Array.isArray(pair) || pair.length < 2) continue;
+    if (pair[0] === id && typeof pair[1] === "string" && pair[1]) return pair[1];
+  }
+  return null;
+}
+
+function shareTitleText(name, siteTitle) {
   const brand = siteTitle || "Cloud Music Hub";
+  const display = getShareDisplayParts(name);
   const titleText = display.artist ? display.artist + " - " + display.title : display.title;
-  const description = display.artist ? titleText + " · " + brand : titleText;
-  const safeTitle = escapeHtmlText(titleText + " | " + brand);
-  const safeDesc = escapeHtmlText(description);
-  const safeUrl = escapeHtmlText(String(requestUrl || "").split("#")[0]);
+  return titleText + " | " + brand;
+}
+
+function buildShareHeadHtml(requestUrl, name, siteTitle, coverId) {
+  const brand = siteTitle || "Cloud Music Hub";
+  const rawUrl = String(requestUrl || "").split("#")[0];
+  let origin = "";
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") origin = parsed.origin;
+  } catch (e) {
+    origin = "";
+  }
+  const imageUrl = origin ? origin + "/og-icon.png" : "/og-icon.png";
+  const pageUrl = origin && !name ? origin + "/" : rawUrl;
   const safeBrand = escapeHtmlText(brand);
-  return "<title>" + safeTitle + "</title>" +
-    "<meta name=\"description\" content=\"" + safeDesc + "\">" +
+  const safeImage = escapeHtmlText(imageUrl);
+  const safeUrl = escapeHtmlText(pageUrl);
+  const imageTags =
+    "<meta property=\"og:image\" content=\"" + safeImage + "\">" +
+    "<meta property=\"og:image:width\" content=\"512\">" +
+    "<meta property=\"og:image:height\" content=\"512\">" +
+    "<meta property=\"og:image:alt\" content=\"" + safeBrand + "\">" +
+    "<meta name=\"twitter:image\" content=\"" + safeImage + "\">" +
+    "<meta name=\"twitter:image:alt\" content=\"" + safeBrand + "\">" +
+    "<meta name=\"twitter:card\" content=\"summary\">" +
+    "<meta property=\"og:site_name\" content=\"" + safeBrand + "\">";
+  if (!name) {
+    const genericTitle = escapeHtmlText(brand);
+    const genericDesc = escapeHtmlText(brand + " · 多源 WebDAV 音乐库");
+    return "<meta name=\"description\" content=\"" + genericDesc + "\">" +
+      "<meta property=\"og:type\" content=\"website\">" +
+      "<meta property=\"og:title\" content=\"" + genericTitle + "\">" +
+      "<meta property=\"og:description\" content=\"" + genericDesc + "\">" +
+      "<meta property=\"og:url\" content=\"" + safeUrl + "\">" +
+      imageTags;
+  }
+  const display = getShareDisplayParts(name);
+  const titleText = display.artist ? display.artist + " - " + display.title : display.title;
+  const safeTitle = escapeHtmlText(titleText + " | " + brand);
+  const description = display.artist ? titleText + " · " + brand : titleText;
+  const safeDesc = escapeHtmlText(description);
+  return "<meta name=\"description\" content=\"" + safeDesc + "\">" +
     "<meta property=\"og:type\" content=\"music.song\">" +
     "<meta property=\"og:title\" content=\"" + safeTitle + "\">" +
     "<meta property=\"og:description\" content=\"" + safeDesc + "\">" +
     "<meta property=\"og:url\" content=\"" + safeUrl + "\">" +
-    "<meta property=\"og:site_name\" content=\"" + safeBrand + "\">" +
-    "<meta name=\"twitter:card\" content=\"summary\">" +
-    "<meta name=\"twitter:title\" content=\"" + safeTitle + "\">" +
-    "<meta name=\"twitter:description\" content=\"" + safeDesc + "\">";
+    imageTags;
 }
 
 function generateTrackId(name) {
@@ -656,6 +918,101 @@ function resolveWebDavUrl(baseUrl, href) {
   }
 }
 
+function parseSingleByteRange(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  const suffixMatch = /^bytes=-(\d+)$/.exec(trimmed);
+  if (suffixMatch) {
+    const suffix = parseInt(suffixMatch[1], 10);
+    if (!isFinite(suffix) || suffix <= 0) return null;
+    return { start: null, end: null, suffix: suffix };
+  }
+  const match = /^bytes=(\d+)-(\d*)$/.exec(trimmed);
+  if (!match) return null;
+  const start = parseInt(match[1], 10);
+  if (!isFinite(start) || start < 0) return null;
+  if (match[2] === "") return { start: start, end: null, suffix: null };
+  const end = parseInt(match[2], 10);
+  if (!isFinite(end) || end < start) return null;
+  return { start: start, end: end, suffix: null };
+}
+
+const AUDIO_CONTENT_TYPES = {
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  mp4: "audio/mp4",
+  alac: "audio/mp4",
+  flac: "audio/flac",
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  opus: "audio/ogg",
+  wav: "audio/wav",
+  aac: "audio/aac",
+  ape: "audio/x-ape",
+  wma: "audio/x-ms-wma",
+  mka: "audio/x-matroska",
+  dsd: "audio/x-dsf",
+  dsf: "audio/x-dsf",
+  dff: "audio/x-dff"
+};
+
+function audioContentTypeFor(fileName) {
+  const name = String(fileName || "");
+  const dot = name.lastIndexOf(".");
+  if (dot < 0 || dot === name.length - 1) return null;
+  return AUDIO_CONTENT_TYPES[name.slice(dot + 1).toLowerCase()] || null;
+}
+
+function sliceReadableStream(stream, start, count) {
+  if (!stream || !(count > 0)) return null;
+  const reader = stream.getReader();
+  let skipped = 0;
+  let sent = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (sent < count) {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            if (sent < count) {
+              controller.error(new Error("upstream body ended after " + sent + " of " + count + " bytes"));
+            } else {
+              controller.close();
+            }
+            return;
+          }
+          let value = chunk.value;
+          if (skipped < start) {
+            const remain = start - skipped;
+            if (value.byteLength <= remain) {
+              skipped += value.byteLength;
+              continue;
+            }
+            value = value.subarray(remain);
+            skipped = start;
+          }
+          if (sent + value.byteLength > count) {
+            value = value.subarray(0, count - sent);
+          }
+          sent += value.byteLength;
+          controller.enqueue(value);
+          if (sent >= count) {
+            controller.close();
+            reader.cancel().catch(() => {});
+          }
+          return;
+        }
+        controller.close();
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+}
+
 async function fetchWebDavList(src) {
   let targetUrl = src.url.endsWith("/") ? src.url : src.url + "/";
 
@@ -776,6 +1133,7 @@ function renderHTML() {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Cloud Music Hub</title>
+  <!--SHARE_HEAD-->
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%231ed760'%3E%3Cpath d='M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z'/%3E%3C/svg%3E">
 
   <style>
@@ -1134,9 +1492,9 @@ function renderHTML() {
 
     @media (max-width: 768px) {
       body { flex-direction: column; height: 100vh; height: 100dvh; }
-      .stage { grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 14px; padding: 64px 14px calc(var(--bar-height, 86px) + 16px + env(safe-area-inset-bottom, 0px)); }
-      .cover-box { width: min(72vw, 300px); }
-      .lyrics-view { height: min(38vh, 300px); }
+      .stage { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 12px; padding: 56px 14px calc(var(--bar-height, 86px) + 12px + env(safe-area-inset-bottom, 0px)); overflow: hidden; }
+      .cover-box { width: auto; height: min(72vw, 300px, 42dvh); aspect-ratio: 1; }
+      .lyrics-view { flex: 1 1 auto; min-height: 88px; height: auto; }
       #bar { grid-template-columns: 36px minmax(0, 1fr) 36px; gap: 12px; padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
       .ctrl-group { min-width: 0; }
       .ctrl-buttons { gap: 12px; flex-wrap: nowrap; }
@@ -1147,6 +1505,12 @@ function renderHTML() {
       #error-banner { top: 12px; max-width: calc(100vw - 48px); font-size: 0.78rem; padding: 6px 10px; }
       #stage-actions { top: 12px; right: 12px; }
       body.drawer-lock .stage, body.drawer-lock .lrc-box { touch-action: none; }
+    }
+
+    @media (max-height: 560px) {
+      .stage { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 10px; padding: 56px 12px calc(var(--bar-height, 86px) + 10px + env(safe-area-inset-bottom, 0px)); overflow: hidden; }
+      .cover-box { width: auto; height: min(48dvh, 40vw, 240px); aspect-ratio: 1; }
+      .lyrics-view { flex: 1 1 auto; min-height: 72px; height: auto; }
     }
 
     @media (max-width: 360px) {
@@ -1329,7 +1693,7 @@ function renderHTML() {
       </button>
     </div>
   </div>
-  <audio id="audio"></audio>
+  <audio id="audio" preload="metadata"></audio>
 
   <div class="modal" id="init-modal">
     <div class="modal-box">
@@ -1543,6 +1907,7 @@ function renderHTML() {
     let playMode = 'repeat';
     let lrcData = [];
     let isAuthed = false;
+    let siteTitle = '';
     let latestDiagnostic = null;
     let lastDiagKey = '';
     let lastDiagTs = 0;
@@ -1551,6 +1916,28 @@ function renderHTML() {
     let isUserScrollingLyrics = false;
     let userScrollTimer = null;
     let jmtLoader = null;
+    let tagCache = new Map();
+    let tagAbort = null;
+    let pendingTag = null;
+    let progressMemory = new Map();
+    let pendingSeek = null;
+    let stallHeartbeat = null;
+    let lastProgressAt = 0;
+    let lastProgressTime = 0;
+    let stallRetries = 0;
+    let userPaused = false;
+    let waitingForGesture = false;
+    let externallyPaused = false;
+    let currentSongRef = null;
+    let currentNodeIndex = 0;
+    let currentIsAuto = false;
+    let lastPersistAt = 0;
+    const STALL_TIMEOUT_MS = 15000;
+    const STALL_HEARTBEAT_MS = 5000;
+    const STALL_MAX_RETRIES = 2;
+    const TAG_CACHE_MAX = 24;
+    const PROGRESS_STORE_KEY = 'webdav_player_progress_v1';
+    const PROGRESS_TTL_MS = 21600000;
 
     function escapeHtml(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -1950,7 +2337,9 @@ function renderHTML() {
       getJsMediaTags().catch(() => {});
       const res = await fetch('/api/status');
       const data = await res.json();
-      if (data.title) document.getElementById('title-text').textContent = data.title;
+      const statusParams = new URLSearchParams(window.location.search);
+      const isSharePage = !!(statusParams.get('play') || statusParams.get('v') || statusParams.get('id'));
+      if (data.title) { siteTitle = data.title; document.getElementById('title-text').textContent = data.title; if (!isSharePage) document.title = data.title; }
       isAuthed = data.isAdmin;
 
       const refreshBtn = document.getElementById('refresh-btn');
@@ -2091,11 +2480,26 @@ function renderHTML() {
     function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false) {
       playToken = playToken + 1;
       resetCoverAmbient();
+      if (tagAbort) tagAbort.abort();
+      tagAbort = new AbortController();
+      pendingTag = null;
+      startStallHeartbeat();
+      stallRetries = 0;
+      userPaused = false;
+      waitingForGesture = false;
+      externallyPaused = false;
+      currentSongRef = song;
       document.getElementById('stitle').textContent = song.name.replace(/\.[^/.]+$/, "");
       document.getElementById('sartist').textContent = "正在解析内嵌标签...";
-      const prevCover = document.getElementById('cover').src;
-      if (prevCover && prevCover.indexOf('blob:') === 0) URL.revokeObjectURL(prevCover);
+      const fallbackTitle = song.name.replace(/\.[^/.]+$/, "");
+      document.title = fallbackTitle + " | " + (siteTitle || "Cloud Music Hub");
+      if (navigator.mediaSession && window.MediaMetadata) {
+        try {
+          navigator.mediaSession.metadata = new window.MediaMetadata({ title: fallbackTitle, artist: '', artwork: [] });
+        } catch (e) {}
+      }
       document.getElementById('cover').src = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' fill='%231f1f1f'><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='%237c7c7c' font-size='12'>读取中</text></svg>";
+      pendingSeek = lastKnownProgress(song);
 
       resumeAutoScroll();
 
@@ -2109,10 +2513,13 @@ function renderHTML() {
     }
 
     async function tryPlayFromNode(song, nodeIndex, isAuto = false) {
-      const token = playToken;
+      const token = ++playToken;
 
       if (!song.availableNodes || nodeIndex >= song.availableNodes.length) {
         if (token !== playToken) return;
+        stopStallHeartbeat();
+        stallRetries = 0;
+        pendingSeek = null;
         reportDiagnostic({
           title: "所有 WebDAV 线路均尝试失败",
           sourceName: "全局容灾",
@@ -2131,13 +2538,23 @@ function renderHTML() {
 
       const streamUrl = '/api/stream?sourceId=' + encodeURIComponent(node.sourceId) + '&file=' + encodeURIComponent(node.href);
 
+      currentNodeIndex = nodeIndex;
+      currentIsAuto = isAuto;
+      if (pendingSeek === null) pendingSeek = lastKnownProgress(song);
+
       audio.src = streamUrl;
+      resetStallMarks();
       const playPromise = audio.play();
       if (playPromise !== undefined) {
         playPromise.then(() => {
           if (token !== playToken) return;
+          waitingForGesture = false;
           document.getElementById('play-icon').setAttribute('href', '#icon-pause');
-        }).catch(err => console.warn("等待缓冲或交互触发:", err));
+        }).catch(err => {
+          if (token !== playToken) return;
+          waitingForGesture = true;
+          console.warn("等待缓冲或交互触发:", err);
+        });
       }
 
       audio.onerror = async () => {
@@ -2154,21 +2571,42 @@ function renderHTML() {
         }
         if (token !== playToken) return;
         console.warn('节点 ' + (nodeIndex + 1) + ' 失败，尝试下一镜像...');
+        pendingSeek = lastKnownProgress(song) || pendingSeek;
         tryPlayFromNode(song, nodeIndex + 1, isAuto);
       };
 
-      parseTagsDirectly(streamUrl, song.name);
+      const cachedTags = tagCache.get(songKey(song));
+      if (cachedTags) {
+        renderTags(cachedTags, song.name);
+      } else {
+        renderLrc('');
+        pendingTag = { song: song, url: streamUrl, token: playToken };
+      }
     }
 
     function togglePlay() {
       if (audio.paused) {
         if (currentIndex === -1 && currentPlaylist.length > 0) {
           playTrackByIndex(0);
-        } else {
-          audio.play();
-          document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+          return;
         }
+        userPaused = false;
+        waitingForGesture = false;
+        externallyPaused = false;
+        startStallHeartbeat();
+        if (currentSongRef && (audio.error !== null || (audio.readyState === 0 && audio.currentTime === 0))) {
+          const restored = lastKnownProgress(currentSongRef);
+          if (restored !== null) {
+            pendingSeek = restored;
+            tryPlayFromNode(currentSongRef, currentNodeIndex, currentIsAuto);
+            return;
+          }
+        }
+        audio.play();
+        document.getElementById('play-icon').setAttribute('href', '#icon-pause');
       } else {
+        userPaused = true;
+        stopStallHeartbeat();
         audio.pause();
         document.getElementById('play-icon').setAttribute('href', '#icon-play');
       }
@@ -2234,6 +2672,16 @@ function renderHTML() {
     }
 
     audio.ontimeupdate = () => {
+      if (!audio.paused && pendingSeek === null && audio.readyState >= 3 && audio.currentTime > lastProgressTime) {
+        lastProgressAt = Date.now();
+        stallRetries = 0;
+      }
+      lastProgressTime = audio.currentTime;
+      const rememberingKey = songKey(currentSongRef);
+      if (pendingSeek === null && isFinite(audio.currentTime)) {
+        if (rememberingKey !== null) progressMemory.set(rememberingKey, audio.currentTime);
+        persistProgress(rememberingKey, audio.currentTime);
+      }
       document.getElementById('time-current').textContent = formatTime(audio.currentTime);
       if (audio.duration) {
         const pct = (audio.currentTime / audio.duration) * 100;
@@ -2268,6 +2716,17 @@ function renderHTML() {
 
     audio.onloadedmetadata = () => {
       document.getElementById('time-duration').textContent = formatTime(audio.duration);
+      if (pendingSeek !== null && isFinite(audio.duration) && pendingSeek > 3 && pendingSeek < audio.duration - 10) {
+        try { audio.currentTime = pendingSeek; } catch (e) {}
+      }
+      pendingSeek = null;
+      resetStallMarks();
+      startStallHeartbeat();
+      if (pendingTag && pendingTag.token === playToken) {
+        const job = pendingTag;
+        pendingTag = null;
+        parseAndCacheTags(job.song, job.url, job.token);
+      }
     };
 
     function resetCoverAmbient() {
@@ -2325,52 +2784,224 @@ function renderHTML() {
       }
     }
 
-    async function parseTagsDirectly(url, fallbackTitle) {
+    function songKey(song) {
+      if (!song) return null;
+      return song.id || song.name || null;
+    }
+
+    function lastKnownProgress(song) {
+      const key = songKey(song);
+      if (key === null) return null;
+      if (progressMemory.has(key)) return progressMemory.get(key);
       try {
-        const jmt = await getJsMediaTags();
-        if (!jmt) {
-          document.getElementById('sartist').textContent = "未知艺术家";
-          renderLrc('');
-          return;
-        }
-
-        const res = await fetch(url, { headers: { 'Range': 'bytes=0-524288' } });
-        if (!res.ok && res.status !== 206) throw new Error();
-        const blob = await res.blob();
-
-        jmt.read(blob, {
-          onSuccess: (tag) => {
-            const t = tag.tags;
-            document.getElementById('stitle').textContent = t.title || fallbackTitle;
-            document.getElementById('sartist').textContent = t.artist || "未知艺术家";
-
-            const cover = document.getElementById('cover');
-            if (t.picture && cover) {
-              const byteArr = new Uint8Array(t.picture.data);
-              const imgBlob = new Blob([byteArr], { type: t.picture.format });
-              const objUrl = URL.createObjectURL(imgBlob);
-              cover.onload = () => { if (cover.src !== objUrl) return; applyCoverAmbient(cover); };
-              cover.onerror = () => { if (cover.src === objUrl) resetCoverAmbient(); };
-              cover.src = objUrl;
-            } else {
-              resetCoverAmbient();
-            }
-
-            let lrc = "";
-            if (t.lyrics) lrc = typeof t.lyrics === 'string' ? t.lyrics : (t.lyrics.lyrics || t.lyrics.data?.lyrics || "");
-            else if (t.USLT) lrc = t.USLT.data?.lyrics || t.USLT.data || "";
-            renderLrc(lrc);
-          },
-          onError: () => {
-            document.getElementById('sartist').textContent = "未知艺术家";
-            renderLrc('');
-          }
-        });
-      } catch (err) {
-        document.getElementById('sartist').textContent = "未知艺术家";
-        renderLrc('');
+        const raw = sessionStorage.getItem(PROGRESS_STORE_KEY);
+        if (!raw) return null;
+        const rec = JSON.parse(raw);
+        if (!rec || rec.key !== key || typeof rec.time !== 'number') return null;
+        if (Date.now() - rec.at > PROGRESS_TTL_MS) return null;
+        if (rec.time < 3) return null;
+        progressMemory.set(key, rec.time);
+        return rec.time;
+      } catch (e) {
+        return null;
       }
     }
+
+    function persistProgress(key, time) {
+      if (key === null || !isFinite(time) || time < 3) return;
+      const now = Date.now();
+      if (now - lastPersistAt < 5000) return;
+      lastPersistAt = now;
+      try {
+        sessionStorage.setItem(PROGRESS_STORE_KEY, JSON.stringify({ key: key, time: time, at: now }));
+      } catch (e) {}
+    }
+
+    function resetStallMarks() {
+      lastProgressTime = audio.currentTime;
+      lastProgressAt = Date.now();
+    }
+
+    function startStallHeartbeat() {
+      stopStallHeartbeat();
+      resetStallMarks();
+      stallHeartbeat = window.setInterval(stallHeartbeatTick, STALL_HEARTBEAT_MS);
+    }
+
+    function stopStallHeartbeat() {
+      if (stallHeartbeat !== null) {
+        window.clearInterval(stallHeartbeat);
+        stallHeartbeat = null;
+      }
+    }
+
+    function stallHeartbeatTick() {
+      if (!currentSongRef || userPaused || waitingForGesture || externallyPaused) return;
+      if (audio.currentTime > lastProgressTime + 0.1) {
+        lastProgressTime = audio.currentTime;
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (audio.readyState >= 3) {
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastProgressAt < STALL_TIMEOUT_MS) return;
+      recoverPlayback();
+    }
+
+    function recoverPlayback() {
+      const song = currentSongRef;
+      if (!song) return;
+      if (stallRetries < STALL_MAX_RETRIES) {
+        stallRetries = stallRetries + 1;
+        console.warn('播放停滞，就地重连并回到上次进度（第 ' + stallRetries + ' 次）');
+        showToast('网络抖动，正在恢复播放位置…');
+        pendingSeek = lastKnownProgress(song);
+        resetStallMarks();
+        tryPlayFromNode(song, currentNodeIndex, currentIsAuto);
+        return;
+      }
+      stallRetries = 0;
+      console.warn('就地重连无效，切换下一镜像线路');
+      resetStallMarks();
+      tryPlayFromNode(song, currentNodeIndex + 1, currentIsAuto);
+    }
+
+    function normalizeTags(t) {
+      const out = { title: null, artist: null, coverUrl: null, lrc: '' };
+      if (!t) return out;
+      out.title = t.title || null;
+      out.artist = t.artist || null;
+      if (t.picture && t.picture.data) {
+        try {
+          const byteArr = new Uint8Array(t.picture.data);
+          out.coverUrl = URL.createObjectURL(new Blob([byteArr], { type: t.picture.format }));
+        } catch (e) {
+          out.coverUrl = null;
+        }
+      }
+      if (t.lyrics) {
+        if (typeof t.lyrics === 'string') out.lrc = t.lyrics;
+        else if (t.lyrics.lyrics) out.lrc = t.lyrics.lyrics;
+        else if (t.lyrics.data && t.lyrics.data.lyrics) out.lrc = t.lyrics.data.lyrics;
+      } else if (t.USLT && t.USLT.data) {
+        out.lrc = t.USLT.data.lyrics || t.USLT.data || '';
+      }
+      return out;
+    }
+
+    async function readEmbeddedTags(url) {
+      try {
+        const jmt = await getJsMediaTags();
+        if (!jmt) return null;
+        const tagUrl = new URL(url, window.location.href).href;
+        return await new Promise((resolve) => {
+          let settled = false;
+          const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+          const reader = jmt.read(tagUrl, {
+            onSuccess: (tag) => done(normalizeTags(tag.tags)),
+            onError: () => done(null)
+          });
+          if (tagAbort) {
+            const cancelTagRead = () => { done(null); if (reader && typeof reader.abort === 'function') { try { reader.abort(); } catch (e) {} } };
+            if (tagAbort.signal.aborted) {
+              cancelTagRead();
+            } else {
+              tagAbort.signal.addEventListener('abort', cancelTagRead);
+            }
+          }
+        });
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function trimTagCache(keepKey, shownKey) {
+      const snapshot = [...tagCache.keys()];
+      for (const tagKey of snapshot) {
+        if (tagCache.size <= TAG_CACHE_MAX) break;
+        if (tagKey === keepKey || tagKey === shownKey) continue;
+        const entry = tagCache.get(tagKey);
+        if (entry && entry.coverUrl) URL.revokeObjectURL(entry.coverUrl);
+        tagCache.delete(tagKey);
+      }
+    }
+
+    function renderTags(tags, fallbackTitle) {
+      document.getElementById('stitle').textContent = (tags && tags.title) || fallbackTitle;
+      document.getElementById('sartist').textContent = (tags && tags.artist) || "未知艺术家";
+      const tagTitle = (tags && tags.title) || fallbackTitle;
+      document.title = tagTitle + " | " + (siteTitle || "Cloud Music Hub");
+      if (navigator.mediaSession && window.MediaMetadata) {
+        try {
+          const coverUrl = tags && tags.coverUrl ? tags.coverUrl : '';
+          navigator.mediaSession.metadata = new window.MediaMetadata({ title: tagTitle, artist: (tags && tags.artist) || '', artwork: coverUrl ? [{ src: coverUrl }] : [] });
+        } catch (e) {}
+      }
+      const cover = document.getElementById('cover');
+      resetCoverAmbient();
+      if (tags && tags.coverUrl && cover) {
+        cover.onload = () => { if (cover.src !== tags.coverUrl) return; applyCoverAmbient(cover); };
+        cover.onerror = () => { if (cover.src === tags.coverUrl) resetCoverAmbient(); };
+        cover.src = tags.coverUrl;
+      }
+      renderLrc(tags ? tags.lrc : '');
+    }
+
+    async function parseAndCacheTags(song, url, token) {
+      const key = songKey(song);
+      if (key === null) return;
+      const cached = tagCache.get(key);
+      if (cached) {
+        if (token === playToken) renderTags(cached, song.name);
+        return;
+      }
+      const tags = await readEmbeddedTags(url);
+      if (tags) {
+        if (tagCache.has(key)) {
+          const discardedCoverUrl = tags.coverUrl;
+          if (discardedCoverUrl) URL.revokeObjectURL(discardedCoverUrl);
+        } else {
+          tagCache.set(key, tags);
+        }
+        trimTagCache(key, songKey(currentSongRef));
+      }
+      if (token !== playToken) return;
+      if (!tags) {
+        renderTags(null, song.name);
+        return;
+      }
+      renderTags(tagCache.get(key) || tags, song.name);
+    }
+
+    audio.onplaying = () => {
+      waitingForGesture = false;
+      externallyPaused = false;
+      resetStallMarks();
+      startStallHeartbeat();
+    };
+    audio.onpause = () => {
+      if (!userPaused) {
+        externallyPaused = true;
+        stopStallHeartbeat();
+      }
+    };
+    audio.onstalled = stallHeartbeatTick;
+    audio.onwaiting = stallHeartbeatTick;
+    window.addEventListener('online', () => {
+      if (currentSongRef && !userPaused && !waitingForGesture) stallHeartbeatTick();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && currentSongRef && !userPaused && !waitingForGesture) stallHeartbeatTick();
+    });
+    window.addEventListener('pagehide', () => {
+      const key = songKey(currentSongRef);
+      if (key === null || !isFinite(audio.currentTime) || audio.currentTime < 3) return;
+      try {
+        sessionStorage.setItem(PROGRESS_STORE_KEY, JSON.stringify({ key: key, time: audio.currentTime, at: Date.now() }));
+      } catch (e) {}
+    });
 
     function renderLrc(lrcText) {
       const container = document.getElementById('lrc-content');

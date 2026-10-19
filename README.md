@@ -12,8 +12,9 @@
 - **多 WebDAV 源**：可视化管理多个 WebDAV 源（别名 / 地址 / 账号 / 密码），可按源切换或“全部合并”并按歌名自动去重；同名歌曲在多源间自动组成镜像线路，播放失败时自动切换下一线路。
 - **标签全部来自文件本身**：通过 jsmediatags 直接解析音频内嵌标签，封面、歌名、艺术家、歌词均读取自音频文件，**不从任何网络接口抓取元数据**。
 - **音频流代理**：Worker 代理 WebDAV 音频流，支持 Range 拖动进度，浏览器直接播放，不向浏览器暴露网盘账号密码。
-- **KV 高速缓存**：曲目列表缓存 30 分钟，访客只读缓存以保护网盘；管理员可强制穿透刷新（30 秒冷却）。
+- **KV 高速缓存**：曲目列表缓存 30 分钟，访客只读缓存以保护网盘；管理员可强制穿透刷新（30 秒冷却）。列表冷构建时还会按源写入一份永不过期的 `id → 歌名` 持久索引，供分享卡片在列表缓存过期后仍能解析出歌名。
 - **8 位极短分享链接**：每首歌生成 `?play=xxxxxxxx` 短链，可直接分享直达播放。
+- **社交分享卡片**：分享短链被微信 / Telegram / Twitter 等抓取时，歌曲卡 `og:image` 指向栅格化站点图标 `og:image`（`/og-icon.png`，512×512）+ `summary` 卡片，并恢复 `og:description`/`og:site_name`；歌曲不可解析或 id 非法时回落同一通用卡片，站点根链接也是通用卡片。逐曲矢量封面 `/og-cover.svg?id=<id>`（1200×630 SVG 横幅）仅作为页面内部资源保留，不用于社交抓取。
 - **播放能力**：列表循环 / 单曲循环 / 随机播放、进度条拖动、音量滑块 + 滚轮微调（Chrome / Firefox / WebKit 内核兼容，记忆音量）、内嵌 LRC 歌词逐行高亮滚动（手动翻阅自动暂停跟随，可一键回到当前进度，点击歌词行跳转播放）。
 - **故障诊断**：WebDAV 出错时给出中文诊断报告（401 / 403 / 404 / 405、网盘 WAF 频控、误填管理页网址等）；控制台仅显示源名与状态摘要，完整诊断详情（含目标地址与原始报文）仅管理员在页内“诊断详情”弹窗可见。
 - **MD3 风格 UI**：Material Design 3 风格图标与暗色配色，右上角 GitHub 徽标入口，站点标题可自定义。
@@ -44,14 +45,16 @@
 
 ```
 src/01-handler.part.js      # 七片 = worker.js 的连续字节切片，按文件名顺序拼接即还原
-src/02-share.part.js        # 分享链接与 HTML 转义
+src/02-share.part.js        # 分享链接、OG 元数据与 HTML 转义
 src/03-text.part.js         # track id / XML 实体 / 歌名归一
 src/04-diagnostic.part.js   # WebDAV 故障中文诊断
 src/05-auth.part.js         # 口令哈希、源 URL 校验、会话与 Cookie
-src/06-webdav.part.js       # 路径收敛、URL 解析、PROPFIND 列表
+src/06-webdav.part.js       # 路径收敛、URL 解析、PROPFIND 列表、Range 解析与流切片
 src/07-render.part.js       # 页面模板区（renderHTML）在这一片里
 golden/worker.head.mjs      # worker.js 的逐字节冻结副本，不依赖 git 的比对锚（.mjs 后缀便于被 import）
-build.mjs                   # 纯 node 拼接器 + 字节相等棘轮
+build.mjs                   # 纯 node 拼接器 + 字节相等棘轮（--record 重录模式）
+tools/make-og-icon.mjs      # 站点图标生成器：栅格化 PNG 并写入 src/02-share.part.js 的图标常量（自带回读自校验）
+test/tools/record.mjs       # golden 重录入口（handler / render 两个显式子命令，无默认模式）
 runtime-lock.mjs            # 运行时版本锁，读取 .node-version
 test/                       # 零依赖回归测试（node:test + node:assert）
 build/out/worker.check.mjs  # 构建时生成的校验副本
@@ -74,6 +77,14 @@ node build.mjs
 
 通过时输出两行：`build: node <当前版本> (major-locked <主版本>, baseline <.node-version>)` 与一行含 **`byte-equal HEAD`** 的成功摘要。判定只看 **`byte-equal HEAD`** 是否出现（片数与字节数随源码变化，不按整行断言）；红的时候退出码非 0，并打印首个差异字节偏移与差异点前后文。
 
+有意改动 `src/` 时，用重录模式推进棘轮基线：
+
+```bash
+node build.mjs --record
+```
+
+它会重写 `worker.js` 与 `build/out/worker.check.mjs`（`golden/worker.head.mjs` 仅在与拼接结果不同步时才重写），并打印与 `HEAD` 的漂移偏移。拼接结果先落 `build/out/worker.check.mjs` 并立即跑 `node --check`，语法不过则删除该中间产物后退出——此时 `worker.js` 与 `golden/worker.head.mjs` 都不会被写。**在人类提交之前**，`node build.mjs`（strict）保持红灯、Tier-4 的「与 `git HEAD` 逐字节相等」那一条也按设计保持红灯，提交后自动转绿；strict 模式在红灯时**不写任何文件**（该性质可用 `git hash-object worker.js golden/worker.head.mjs build/out/worker.check.mjs` 在红灯前后各跑一次对照验证）。golden 记录的重录入口是 `node test/tools/record.mjs handler` 与 `node test/tools/record.mjs render`（无默认模式，每次重录都是一次可审查的显式动作）。
+
 ### 回归测试
 
 集成层会 `import` 构建产物 `build/out/worker.check.mjs`，因此**必须先构建、再测试**：
@@ -87,14 +98,16 @@ node --test "test/*.test.mjs"
 
 | 层 | 文件 | 覆盖 |
 |---|---|---|
-| Tier-1 单元 | `test/01-unit.test.mjs` | 纯函数：HTML 转义、track id、歌名/歌词归一、源 URL 校验、会话、诊断分支表 |
-| Tier-2 集成 | `test/02-handler.test.mjs` | 全路由 handler（打桩 `fetch` + 内存 KV + 真实 WebCrypto + 冻结时钟） |
-| Tier-3 快照 | `test/03-render-snapshot.test.mjs` | `renderHTML` 长度 / SHA-256 / 结构锚点 |
+| Tier-1 单元 | `test/01-unit.test.mjs` | 纯函数：HTML 转义、track id、歌名/歌词归一、源 URL 校验、会话、诊断分支表、Range 解析、Content-Type 兜底、流切片、分享索引归一与图标资产 |
+| Tier-2 集成 | `test/02-handler.test.mjs` | 全路由 handler（打桩 `fetch` + 内存 KV + 真实 WebCrypto + 冻结时钟）；golden 记录外置在 `test/golden/handler-scenarios.json`，与场景矩阵双向 1:1 校验 |
+| Tier-3 快照 | `test/03-render-snapshot.test.mjs` | `renderHTML` 长度 / SHA-256 / 结构锚点，外加移动端反重叠几何不变式、分享 head 锚点锁与播放韧性结构锁 |
 | Tier-4 对拍 | `test/00-build-parity.test.mjs` | 切片拼接 vs `HEAD` vs `golden` vs 构建产物 vs 工作区 `worker.js` 的字节与语义一致性 |
 
 全绿判据：末行 TAP 汇总为 `# fail 0`。
 
 ## 部署
+
+0. **CI 自动部署（当前方式）**：仓库已连接 Cloudflare Workers Builds，push 到默认分支后由 CF 构建环境执行 `npx wrangler deploy`，配置取自仓库根的 `wrangler.toml`；构建日志在 CF Dashboard → 该 Worker → Deployments / Builds 查看。下方 1-6 是等效的手工粘贴路径，作为替代方式保留。
 
 1. 在 Cloudflare Dashboard 创建一个 Worker。
 2. 创建一个 KV 命名空间，并在 Worker 设置中将其绑定为变量 **`MUSIC_KV`**（变量名大小写必须完全一致，否则启动即提示 500 错误）。
@@ -102,6 +115,8 @@ node --test "test/*.test.mjs"
 4. 打开 Worker 页面，首次访问会弹出初始化窗口：设置站点标题与管理员密码（密码同时作为 Cookie 登录凭证，30 天免密）。
 5. 进入“设置” → 添加 WebDAV 源（别名、WebDAV 地址、账号、密码）→ 保存更改。没有测试过免登录的WebDAV源。
 6. 管理面板支持将源配置导出为 JSON 备份，也可从 JSON 导入并按 URL 自动合并更新，这也意味着目前同一个地址只会更新里面的账号鉴权信息，不会因为这是另外一个账号就新开一个源。此外支持"复制口令 / 粘贴口令"：用单行 `WMP1.` 加密文本在两份部署之间直接转移源配置——口令只与导出时设置的加密口令绑定（与登录密码无关），口令文本本质是在转移账号凭据，请只发给可信的人。
+
+> 本仓库的 `wrangler.toml` 保存的是本站点自己的 Worker 名与 KV 命名空间 ID；复刻到你自己的账号时，请把 `name` 与 `[[kv_namespaces]] id` 替换为你自己的值，否则部署会报 code 10041（namespace not found）。
 
 ## 使用说明
 
