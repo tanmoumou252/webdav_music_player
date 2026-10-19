@@ -1,0 +1,139 @@
+name: Aggregate Bot Reviews on Current Round
+
+# Repository requirement: this workflow relies on the `pull_request_target` trigger, which
+# GitHub restricts by default for fork PRs (workflows not run until a maintainer approves).
+# The repository Actions settings MUST allow `pull_request_target` to run so that stale-label
+# cleanup still fires on fork contributions. This trigger is intentionally retained (see the
+# security invariant under `on:`): the documented requirement is fork-PR label cleanup without
+# checking out PR head code. As of 2026-11-02 GitHub tightens this default; no silent fallback
+# is provided here — operator must keep the setting enabled for cleanup to run.
+
+on:
+  check_run:
+    types: [completed]
+  pull_request_review:
+    types: [submitted]
+  # Fork PR review events run in the merge-commit context with a read-only GITHUB_TOKEN, so
+  # the review trigger above cannot write labels for fork PRs: its run only wakes the job, the
+  # writes fail closed (403). issue_comment is delivered to the base repository and executes
+  # this default-branch workflow with the base repo's token, so it is the trusted writer path
+  # for fork rounds (the barrier still requires authenticated head-matching reviews, which
+  # this job reads via the API; the comment only wakes evaluation). A bot review whose last
+  # walkthrough edit precedes its review submission and produces no later trusted event is a
+  # declared liveness gap of the single-writer design, not a write gap.
+  issue_comment:
+    types: [created, edited]
+  # Security invariant: pull_request_target runs in the base repository context with label
+  # write access. This workflow only reads event metadata and calls the GitHub API to manage
+  # labels — it must NEVER check out the PR head, fetch fork refs, or execute any
+  # pull-request-supplied code (see the pull_request_target guard in the script below).
+  # Current permissions contain no contents:write; further narrowing is a separate review
+  # topic, not covered by this comment. Do not replace this trigger with pull_request: fork
+  # PRs would then stop emitting events without maintainer approval, silently breaking
+  # stale-label cleanup for fork contributions.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+# PR 解析完成后由 sync-labels job 以 PR 编号串行；无法归因的 check_run 不进入写标签 job。
+
+permissions:
+  # contents: read 仅供 resolve-pr 与 sync-labels 中 actions/checkout 拉取默认分支脚本本体；
+  #   显式声明是必需的（顶层 permissions 块存在时未列出的权限一律归零）。仍无 contents 写权：
+  #   HEAD 徽章走 shields 动态外链（不落库），本工作流从不写仓库文件。
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+  actions: read     # auto-fill 佐证核验（getWorkflowRun 权威记录回查）
+  statuses: read    # auto-fill 佐证核验（listCommitStatusesForRef 读取 head commit 上的佐证 status）
+
+# CI 引擎解耦：两段业务逻辑（原 ~1140 行 actions/github-script）已整体迁入本地可独立运行的
+#   .github/scripts/bot-review-labeler.mjs。CI 引擎仅负责触发/权限/密钥注入与脚本本体检出：
+#   - 两 job 各 `actions/checkout` 钉 ref=${{ github.event.repository.default_branch }} 取脚本本体；
+#     禁用 base_ref/head_ref（本工作流触发集 check_run/issue_comment/pull_request_review 无 base_ref，
+#     照搬 base_ref 会取空退化检出 fork head → 供应链 RCE，r1 影子 E-1）；
+#   - persist-credentials:false（从不写仓库文件，无 contents:write）；
+#   - 事件/凭证只经 env 注入，run 行零 ${{ }} 内联插值（反注入闸，由
+#     checks/bot-labeler-workflow-selftest.mjs 锚 workflow-run-lines-zero-interpolation 强制）。
+
+jobs:
+  resolve-pr:
+    # 评论唤醒的分流闸前置到触发层：issue_comment 若非受信官方 Bot 作者、或不是 PR 评论
+    # （issue.pull_request 缺席＝普通 issue 顶层评论），在此直接丢弃——不分配 runner、
+    # 不跑 resolve-pr，杜绝「任意评论先拉起工作流、进 job 才发现类型不对」的过程浪费。
+    # 官方 Bot 登录名单一事实源＝工作流顶部 env（脚本内 BOT_DEFINITIONS 与之同源逐字）。
+    # 触发收敛（上游实质变化才重评，人类定版）：issue_comment 事件里 review 内联评论的
+    # created/edited 也被 GitHub 投递为 issue_comment（实测 run #101：kilo 内联 edited 触发全量
+    # 重评）。顶层摘要评论无 pull_request_url 字段、内联评论有——job-gate 据此排除内联事件，
+    # 杜绝「内联编辑也拉起 resolve-pr+sync-labels」的过程浪费（skipped run 记录仍会产生，但
+    # 零 runner、零 API）。
+    if: >
+      github.event_name != 'issue_comment' ||
+      (github.event.comment.user.type == 'Bot' &&
+       contains('coderabbitai[bot],kilo-code-bot[bot]', github.event.comment.user.login) &&
+       github.event.comment.pull_request_url == null &&
+       github.event.issue.pull_request != null)
+    runs-on: ubuntu-24.04
+    outputs:
+      number: ${{ steps.resolve.outputs.number }}
+    steps:
+      # 取脚本本体：钉默认分支（非 base_ref/head_ref，E-1 供应链 RCE 防护），不检出 PR 代码、不持久化凭证。
+      - name: Checkout default branch (base repo, script source only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          # 不传 repository：checkout 默认 github.repository＝基仓库（pull_request_target 运行于基上下文），
+          #   绝不取事件仓库（check_run / fork review 的 event.repository 可为 fork），否则 fork 可控
+          #   .github/scripts/*.mjs 以基仓库写标签 token 执行＝供应链 RCE（PR-Reviewer E-1）。
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve PR number
+        id: resolve
+        if: github.event_name != 'issue_comment' || (github.event.comment.user.type == 'Bot' && github.event.comment.pull_request_url == null)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/bot-review-labeler.mjs resolve-pr
+
+  sync-labels:
+    needs: resolve-pr
+    # 双层前置分流：issue_comment 仅在受信 Bot 作者（与 resolve-pr 同一 login 白名单 env）的
+    # **顶层**摘要评论事件（无 pull_request_url）时才进入本 job——内联评论编辑事件在
+    # resolve-pr 层已被排除，此处再拦一道为纵深防御。check_run 仍按名称/app slug 归因。
+    # 脚本内 Bot 作者闸保留为第三层。
+    if: >
+      needs.resolve-pr.outputs.number != '' &&
+      (github.event_name == 'pull_request_target' ||
+       github.event_name == 'pull_request_review' ||
+       (github.event_name == 'issue_comment' &&
+        github.event.comment.user.type == 'Bot' &&
+        github.event.comment.pull_request_url == null &&
+        contains('coderabbitai[bot],kilo-code-bot[bot]', github.event.comment.user.login)) ||
+       contains(github.event.check_run.name, 'CodeRabbit') ||
+       contains(github.event.check_run.app.slug, 'coderabbit') ||
+       contains(github.event.check_run.name, 'Kilo') ||
+       contains(github.event.check_run.app.slug, 'kilo'))
+    concurrency:
+      group: bot-sync-${{ needs.resolve-pr.outputs.number }}
+      queue: max
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    env:
+      EXPECTED_BOTS: 'coderabbit,kilocode'
+      CODERABBIT_MAX_FILES: '100'
+      CODERABBIT_MIN_STARS: '10'
+      PR_NUMBER: ${{ needs.resolve-pr.outputs.number }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # 取脚本本体：同 resolve-pr——不传 repository（默认 github.repository＝基仓库），钉默认分支取脚本，
+      #   禁 base_ref/head_ref（E-1）与禁 event.repository 派生 repository（fork 可控脚本供应链 RCE，PR-Reviewer E-1）。
+      - name: Checkout default branch (base repo, script source only)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Auto-Provision Labels, Wait for Bots & Apply Verdict
+        # node24 运行时（runner 内置）；脚本本体经上一步 actions/checkout 钉默认分支取得。
+        run: node .github/scripts/bot-review-labeler.mjs
