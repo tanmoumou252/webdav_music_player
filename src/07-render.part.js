@@ -793,6 +793,7 @@ function renderHTML() {
     let pendingTag = null;
     let progressMemory = new Map();
     let pendingSeek = null;
+    let pendingShareSeek = null;
     let stallHeartbeat = null;
     let lastProgressAt = 0;
     let lastProgressTime = 0;
@@ -923,6 +924,24 @@ function renderHTML() {
       return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
     }
 
+    function parseShareTime(raw) {
+      if (typeof raw !== "string") return null;
+      const m = raw.match(/^((?:\\d{1,2})h)?((?:\\d{1,3})m)?((?:\\d{1,2})s)?$/);
+      if (!m || (!m[1] && !m[2] && !m[3])) return null;
+      const sec = (m[1] ? parseInt(m[1], 10) * 3600 : 0) + (m[2] ? parseInt(m[2], 10) * 60 : 0) + (m[3] ? parseInt(m[3], 10) : 0);
+      if (!isFinite(sec) || sec < 3 || sec >= 86400) return null;
+      return sec;
+    }
+
+    function formatShareTime(sec) {
+      if (!isFinite(sec) || sec < 3) return "";
+      let rest = Math.floor(sec);
+      const h = Math.floor(rest / 3600); rest -= h * 3600;
+      const m = Math.floor(rest / 60); rest -= m * 60;
+      const s = rest;
+      return (h ? h + "h" : "") + (m ? m + "m" : "") + (s ? s + "s" : "");
+    }
+
     function showToast(msg) {
       const toast = document.getElementById('toast');
       toast.textContent = msg;
@@ -1037,10 +1056,11 @@ function renderHTML() {
         return showToast('请先选择一首歌播放');
       }
       const song = currentPlaylist[currentIndex];
-      const shareUrl = window.location.origin + window.location.pathname + '?play=' + song.id;
+      const stamp = formatShareTime(audio.currentTime);
+      const shareUrl = window.location.origin + window.location.pathname + '?play=' + song.id + (stamp ? '&t=' + stamp : "");
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(shareUrl).then(() => {
-          showToast('已复制 8 位精简直达分享链接！');
+          showToast(stamp ? '已复制链接（从 ' + formatTime(audio.currentTime) + ' 开始播放）' : '已复制 8 位精简直达分享链接！');
         }).catch(() => fallbackCopyText(shareUrl));
       } else {
         fallbackCopyText(shareUrl);
@@ -1231,6 +1251,7 @@ function renderHTML() {
       const urlParams = new URLSearchParams(window.location.search);
       const targetPlayId = urlParams.get('play') || urlParams.get('v') || urlParams.get('id');
       const legacySongName = urlParams.get('song');
+      if (targetPlayId || legacySongName) pendingShareSeek = parseShareTime(urlParams.get('t'));
 
       await loadPlaylist(false, targetPlayId, legacySongName);
     }
@@ -1372,8 +1393,14 @@ function renderHTML() {
       }
       document.getElementById('cover').src = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' fill='%231f1f1f'><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='%237c7c7c' font-size='12'>读取中</text></svg>";
       if (resume) {
-        pendingSeek = lastKnownProgress(song);
+        if (pendingShareSeek !== null) {
+          pendingSeek = pendingShareSeek;
+          pendingShareSeek = null;
+        } else {
+          pendingSeek = lastKnownProgress(song);
+        }
       } else {
+        pendingShareSeek = null;
         forgetProgress(song);
         pendingSeek = null;
       }

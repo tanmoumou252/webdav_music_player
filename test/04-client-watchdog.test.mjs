@@ -77,6 +77,7 @@ function runClient(scriptText, options = {}) {
     setItem(k, v) { this._m[k] = String(v); },
     removeItem(k) { delete this._m[k]; },
   };
+  const clip = { texts: [], writeText(t) { clip.texts.push(t); return Promise.resolve(); } };
   const windowStub = {
     setInterval: timers.setInterval,
     clearInterval: timers.clearInterval,
@@ -94,7 +95,7 @@ function runClient(scriptText, options = {}) {
     document: documentStub,
     localStorage: storage,
     navigator: {
-      clipboard: { writeText() { return Promise.resolve(); } },
+      clipboard: clip,
       mediaSession: {
         metadata: null,
         setActionHandler() {},
@@ -126,14 +127,19 @@ function runClient(scriptText, options = {}) {
   sandbox.globalThis = sandbox;
   const hook =
     "\n;globalThis.__T = {" +
-    "getState: () => ({ stallHeartbeat, stallRetries, pendingSeek, playToken, currentNodeIndex, currentSongRef, lastProgressTime, title: document.title, mediaMetadata: navigator.mediaSession ? navigator.mediaSession.metadata : null, siteTitle: window.__siteTitle })," +
+    "getState: () => ({ stallHeartbeat, stallRetries, pendingSeek, shareSeek: pendingShareSeek, playToken, currentNodeIndex, currentSongRef, lastProgressTime, title: document.title, mediaMetadata: navigator.mediaSession ? navigator.mediaSession.metadata : null, siteTitle: window.__siteTitle })," +
     "audio, fireTimeUpdate: () => { const f = audio.ontimeupdate; if (f) f(); }," +
     "getTagAbort: () => tagAbort," +
     "readEmbeddedTags," +
+    "parseShareTime: typeof parseShareTime === 'function' ? parseShareTime : null," +
+    "formatShareTime: typeof formatShareTime === 'function' ? formatShareTime : null," +
+    "armShareSeek: typeof pendingShareSeek !== 'undefined' ? (v) => { pendingShareSeek = v; } : null," +
+    "seedShareSong: (song, time) => { currentPlaylist = [song]; currentIndex = 0; audio.currentTime = time; }," +
+    "copyShareUrl: () => copyCurrentSongShareUrl()," +
     "tryPlayFromNode, startStallHeartbeat, stopStallHeartbeat, recoverPlayback, stallHeartbeatTick, startPlayback" +
     "};";
   runInNewContext(prelude + scriptText + hook, sandbox, { filename: "client.js" });
-  return { T: sandbox.__T, timers, sandbox };
+  return { T: sandbox.__T, timers, sandbox, clip };
 }
 
 const SONG = { id: "abc12345", name: "Alpha - One.mp3", availableNodes: [{ sourceId: "s1", href: "Alpha%20-%20One.mp3" }] };
@@ -371,4 +377,83 @@ test("site title sync: a share page keeps its server-set tab title, init must no
   });
   await flushMicrotasks();
   assert.equal(T.getState().title, "", "the server-rendered share title is authoritative; init() must leave document.title untouched when a play/v/id param is present");
+});
+
+test("share time parse: youtube-style units only, floor at 3s", () => {
+  const { T } = runClient(extractClientScript());
+  assert.equal(T.parseShareTime("1m30s"), 90);
+  assert.equal(T.parseShareTime("45s"), 45);
+  assert.equal(T.parseShareTime("2m"), 120);
+  assert.equal(T.parseShareTime("1h"), 3600);
+  assert.equal(T.parseShareTime("1h2m3s"), 3723);
+  assert.equal(T.parseShareTime("3s"), 3);
+  assert.equal(T.parseShareTime("2s"), null, "below the 3s floor means no meaningful stamp");
+  assert.equal(T.parseShareTime("90"), null, "unit-less seconds are rejected");
+  assert.equal(T.parseShareTime("1:30"), null, "colon form is rejected");
+  assert.equal(T.parseShareTime("abc"), null);
+  assert.equal(T.parseShareTime(""), null);
+  assert.equal(T.parseShareTime("86400s"), null, "a day-long stamp is noise for a track");
+  assert.equal(T.parseShareTime("86399s"), null, "s-group caps at 2 digits, so 5-digit seconds never match");
+  assert.equal(T.parseShareTime("23h59m59s"), 86399, "the largest legal sub-day stamp survives");
+  assert.equal(T.formatShareTime(90) && T.parseShareTime(T.formatShareTime(90)) === 90, true, "roundtrip: 90");
+  assert.equal(T.formatShareTime(3723) && T.parseShareTime(T.formatShareTime(3723)) === 3723, true, "roundtrip: 1h2m3s");
+  assert.equal(T.formatShareTime(60) && T.parseShareTime(T.formatShareTime(60)) === 60, true, "roundtrip: 60");
+  assert.equal(T.formatShareTime(3600) && T.parseShareTime(T.formatShareTime(3600)) === 3600, true, "roundtrip: 3600");
+});
+
+test("share time format: floor, unit compaction, <3s becomes empty", () => {
+  const { T } = runClient(extractClientScript());
+  assert.equal(T.formatShareTime(90), "1m30s");
+  assert.equal(T.formatShareTime(45), "45s");
+  assert.equal(T.formatShareTime(120), "2m");
+  assert.equal(T.formatShareTime(3605), "1h5s");
+  assert.equal(T.formatShareTime(3723), "1h2m3s");
+  assert.equal(T.formatShareTime(2), "", "under the floor formats to nothing");
+  assert.equal(T.formatShareTime(NaN), "");
+  assert.equal(T.formatShareTime(95.7), "1m35s", "fractional playhead floors");
+});
+
+test("url share time overrides remembered progress once", () => {
+  const { T } = runClient(extractClientScript());
+  T.startPlayback(SONG, 0, false, false);
+  T.audio.paused = false; T.audio.readyState = 4; T.audio.currentTime = 40;
+  T.fireTimeUpdate();
+  T.armShareSeek(90);
+  T.startPlayback(SONG, 0, false, false, true);
+  assert.equal(T.getState().pendingSeek, 90, "the shared t must win over the local 40s record");
+  assert.equal(T.getState().shareSeek, null, "the armed share time is consumed once");
+  T.startPlayback(SONG, 0, false, false, true);
+  assert.equal(T.getState().pendingSeek, 40, "the next resume falls back to the local record");
+});
+
+test("active start drops an armed share time", () => {
+  const { T } = runClient(extractClientScript());
+  T.armShareSeek(90);
+  T.startPlayback(SONG, 0, false, false);
+  assert.equal(T.getState().shareSeek, null, "a resume=false start must not leave the stamp armed for later");
+  assert.equal(T.getState().pendingSeek, null, "and still plays from zero");
+});
+
+test("out-of-range share stamp is dropped by the existing metadata guard", () => {
+  const { T } = runClient(extractClientScript());
+  T.armShareSeek(9000);
+  T.startPlayback(SONG, 0, false, false, true);
+  assert.equal(T.getState().pendingSeek, 9000, "armed value reaches pendingSeek untouched at start");
+  T.audio.duration = 100;
+  T.audio.onloadedmetadata();
+  assert.equal(T.getState().pendingSeek, null, "the guard must clear without seeking");
+  assert.equal(T.audio.currentTime, 0, "no seek applied when the track is shorter than the stamp");
+});
+
+test("share copy embeds t from the playhead and stays plain before playback", () => {
+  const { T, clip } = runClient(extractClientScript(), {
+    windowOverrides: { location: { search: "", href: "https://app.example.com/", pathname: "/", origin: "https://app.example.com" } },
+  });
+  T.seedShareSong(SONG, 95);
+  T.copyShareUrl();
+  assert.deepEqual(clip.texts, ["https://app.example.com/?play=abc12345&t=1m35s"]);
+  T.seedShareSong(SONG, 0);
+  T.copyShareUrl();
+  assert.equal(clip.texts.length, 2);
+  assert.equal(clip.texts[1], "https://app.example.com/?play=abc12345", "no playhead, no t");
 });

@@ -10,8 +10,8 @@ function compactTemplate(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-const GOLDEN_SHA256 = "faab0632f604f309f781bb7ed69ce2ebf7882a14a85278275edf0ac6f5780c7a";
-const GOLDEN_LENGTH = 107173;
+const GOLDEN_SHA256 = "4552f6309eaeffb87f1a5a2712c6c0c5d6f891cb82817ef44a78121534a1d17f";
+const GOLDEN_LENGTH = 108409;
 
 test("Tier-3 renderHTML snapshot: golden length & sha256 master", () => {
   const html = renderHTML();
@@ -111,6 +111,11 @@ test("Tier-3 playback resilience lock: heartbeat watchdog, resume and tag cache 
   assert.ok(html.includes("if (pendingSeek === null) pendingSeek = lastKnownProgress(song);"), "tryPlayFromNode:1415 backfill must stay — recoverPlayback:1740 next-mirror resume depends solely on it");
   assert.ok(html.includes("function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false, resume = false) {"), "startPlayback must carry the trailing resume param after isAuto (guards A-9 形参序漂移)");
   assert.ok(html.includes("forgetProgress(song);"), "the active-start (resume=false) branch must forget progress, not merely null pendingSeek");
+  assert.ok(html.includes("function parseShareTime(raw) {"), "share-time parser must exist (t=1m30s contract)");
+  assert.ok(html.includes("function formatShareTime(sec) {"), "share-time formatter must exist");
+  assert.ok(html.includes("let pendingShareSeek = null;"), "the one-shot share seek slot must exist");
+  assert.ok(html.includes("if (targetPlayId || legacySongName) pendingShareSeek = parseShareTime(urlParams.get('t'));"), "init must arm the share time only alongside a play target");
+  assert.ok(html.includes("'&t=' + stamp"), "the copy path must embed the stamp");
   assert.ok(html.includes("let tagCache = new Map();"));
   assert.ok(html.includes("async function parseAndCacheTags(song, url, token)"));
   assert.ok(

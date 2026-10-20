@@ -55,7 +55,6 @@ const HANDLES = [
   "getShareDisplayParts",
   "escapeHtmlText",
   "buildShareHeadHtml",
-  "OG_ICON_PNG_B64",
   "shareTitleText",
   "decodeOgIconPng",
   "OG_ICON_PNG_B64",
