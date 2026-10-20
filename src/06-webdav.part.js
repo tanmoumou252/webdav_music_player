@@ -115,6 +115,14 @@ function audioContentTypeFor(fileName) {
   return AUDIO_CONTENT_TYPES[name.slice(dot + 1).toLowerCase()] || null;
 }
 
+function parseContentRangeTotal(value) {
+  if (!value) return null;
+  const match = /\/\s*(\d+)\s*$/.exec(String(value).trim());
+  if (!match) return null;
+  const total = parseInt(match[1], 10);
+  return Number.isFinite(total) && total >= 0 ? total : null;
+}
+
 function sliceReadableStream(stream, start, count) {
   if (!stream || !(count > 0)) return null;
   const reader = stream.getReader();

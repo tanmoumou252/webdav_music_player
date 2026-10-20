@@ -127,7 +127,7 @@ function runClient(scriptText, options = {}) {
   sandbox.globalThis = sandbox;
   const hook =
     "\n;globalThis.__T = {" +
-    "getState: () => ({ stallHeartbeat, stallRetries, pendingSeek, shareSeek: pendingShareSeek, playToken, currentNodeIndex, currentSongRef, lastProgressTime, title: document.title, mediaMetadata: navigator.mediaSession ? navigator.mediaSession.metadata : null, siteTitle: window.__siteTitle })," +
+    "getState: () => ({ stallHeartbeat, stallRetries, pendingSeek, shareSeek: pendingShareSeek, playToken, currentNodeIndex, currentSongRef, lastProgressTime, waitingForGesture, userPaused, externallyPaused, title: document.title, mediaMetadata: navigator.mediaSession ? navigator.mediaSession.metadata : null, siteTitle: window.__siteTitle })," +
     "audio, fireTimeUpdate: () => { const f = audio.ontimeupdate; if (f) f(); }," +
     "getTagAbort: () => tagAbort," +
     "readEmbeddedTags," +
@@ -136,7 +136,7 @@ function runClient(scriptText, options = {}) {
     "armShareSeek: typeof pendingShareSeek !== 'undefined' ? (v) => { pendingShareSeek = v; } : null," +
     "seedShareSong: (song, time) => { currentPlaylist = [song]; currentIndex = 0; audio.currentTime = time; }," +
     "copyShareUrl: () => copyCurrentSongShareUrl()," +
-    "tryPlayFromNode, startStallHeartbeat, stopStallHeartbeat, recoverPlayback, stallHeartbeatTick, startPlayback" +
+    "tryPlayFromNode, startStallHeartbeat, stopStallHeartbeat, recoverPlayback, stallHeartbeatTick, startPlayback, togglePlay" +
     "};";
   runInNewContext(prelude + scriptText + hook, sandbox, { filename: "client.js" });
   return { T: sandbox.__T, timers, sandbox, clip };
@@ -456,4 +456,92 @@ test("share copy embeds t from the playhead and stays plain before playback", ()
   T.copyShareUrl();
   assert.equal(clip.texts.length, 2);
   assert.equal(clip.texts[1], "https://app.example.com/?play=abc12345", "no playhead, no t");
+});
+
+test("client stall-resume: a play() rejection is auto-recovered once canplay fires (no manual re-click)", async () => {
+  const { T } = runClient(extractClientScript());
+  await flushMicrotasks();
+  let playCalls = 0;
+  let rejectNext = true;
+  T.audio.play = () => { playCalls += 1; return rejectNext ? Promise.reject(new Error("blocked")) : Promise.resolve(); };
+  T.audio.paused = true;
+  T.startPlayback(SONG, 0, false, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().waitingForGesture, true, "precondition: a rejected play wedged the player into waitingForGesture");
+  assert.equal(typeof T.audio.oncanplay, "function", "the client must wire an oncanplay auto-resume handler");
+  rejectNext = false;
+  const before = playCalls;
+  T.audio.oncanplay();
+  await flushMicrotasks();
+  assert.ok(playCalls > before, "canplay must re-issue play() so the track starts on its own");
+  assert.equal(T.getState().waitingForGesture, false, "a successful resume-play must clear waitingForGesture");
+});
+
+test("client stall-resume: an externally-paused element must NOT be auto-resumed by canplay", async () => {
+  const { T } = runClient(extractClientScript());
+  await flushMicrotasks();
+  let playCalls = 0;
+  let rejectNext = true;
+  T.audio.play = () => { playCalls += 1; return rejectNext ? Promise.reject(new Error("blocked")) : Promise.resolve(); };
+  T.audio.paused = true;
+  T.startPlayback(SONG, 0, false, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().waitingForGesture, true, "precondition: wedged");
+  rejectNext = false;
+  T.audio.onpause();
+  assert.equal(T.getState().externallyPaused, true, "precondition: a non-user pause set externallyPaused");
+  const before = playCalls;
+  T.audio.oncanplay();
+  await flushMicrotasks();
+  assert.equal(playCalls, before, "externallyPaused must gate the auto-resume — no auto play()");
+});
+
+test("client stall-resume: the heartbeat attempts one resume while gesture-pending instead of muting forever", async () => {
+  const { T } = runClient(extractClientScript());
+  await flushMicrotasks();
+  let playCalls = 0;
+  let rejectNext = true;
+  T.audio.play = () => { playCalls += 1; return rejectNext ? Promise.reject(new Error("blocked")) : Promise.resolve(); };
+  T.audio.paused = true;
+  T.startPlayback(SONG, 0, false, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().waitingForGesture, true, "precondition: wedged; the old watchdog would dead-return here");
+  rejectNext = false;
+  const before = playCalls;
+  T.stallHeartbeatTick();
+  await flushMicrotasks();
+  assert.ok(playCalls > before, "the re-armed watchdog must try to resume on its heartbeat, not return on waitingForGesture");
+  assert.equal(T.getState().stallRetries, 0, "a gesture-pending resume must not charge the line-switch budget (it is not a line stall)");
+});
+
+test("client stall-resume: an explicit user pause must NEVER be auto-resumed by canplay or the heartbeat", async () => {
+  const { T } = runClient(extractClientScript());
+  await flushMicrotasks();
+  let playCalls = 0;
+  let rejectNext = true;
+  T.audio.play = () => { playCalls += 1; return rejectNext ? Promise.reject(new Error("blocked")) : Promise.resolve(); };
+  T.audio.paused = true;
+  T.startPlayback(SONG, 0, false, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().waitingForGesture, true, "precondition: wedged after a rejected play");
+  rejectNext = false;
+  T.audio.paused = false;
+  T.togglePlay();
+  await flushMicrotasks();
+  assert.equal(T.getState().userPaused, true, "precondition: an explicit user pause (togglePlay else-branch) set userPaused and stopped the heartbeat");
+  const before = playCalls;
+  T.audio.oncanplay();
+  T.stallHeartbeatTick();
+  await flushMicrotasks();
+  assert.equal(playCalls, before, "userPaused must hard-gate EVERY auto-resume path — the user's pause is never broken by canplay or the watchdog (E-2 safety invariant)");
+});
+
+test("client stall-resume mutation: removing the oncanplay wiring leaves the wedge with no resume source", async () => {
+  const raw = extractClientScript();
+  assert.ok(/audio\.oncanplay = \(\) => \{/.test(raw), "the oncanplay wiring must exist before mutation");
+  const mutated = raw.replace(/audio\.oncanplay = \(\) => \{[\s\S]*?\};/, "/* oncanplay removed */");
+  assert.ok(!/audio\.oncanplay/.test(mutated), "mutation must strip the oncanplay handler");
+  const { T } = runClient(mutated);
+  await flushMicrotasks();
+  assert.equal(typeof T.audio.oncanplay, "undefined", "without the wiring the element has no canplay auto-resume — proves test 1 is load-bearing");
 });
