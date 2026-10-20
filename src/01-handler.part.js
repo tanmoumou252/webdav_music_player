@@ -81,24 +81,6 @@ export default {
       });
     }
 
-    if (url.pathname === "/og-cover.svg") {
-      const coverId = url.searchParams.get("id") || "";
-      try {
-        const coverName = await resolveSharedSongName(env, coverId);
-        const svg = buildOgCoverSvg(coverId, coverName);
-        if (!svg) return new Response("Not Found", { status: 404, headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" } });
-        return new Response(svg, {
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "image/svg+xml; charset=utf-8",
-            "Cache-Control": "public, max-age=86400"
-          }
-        });
-      } catch (e) {
-        return new Response("Not Found", { status: 404, headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" } });
-      }
-    }
-
     const getCookieToken = () => {
       const cookie = request.headers.get("Cookie") || "";
       const match = cookie.match(/admin_token=([^;]+)/);

@@ -875,22 +875,6 @@ export function scenarios() {
       }),
     },
     {
-      name: "og-cover-svg-hit",
-      seedKV: seedAdmin({
-        cache_v3_list_all: JSON.stringify({ items: [{ id: "d3cb8b17", name: "Artist - Title.mp3" }] }),
-      }),
-      request: GET("/og-cover.svg?id=d3cb8b17"),
-      stub: null,
-      post: async () => ({}),
-    },
-    {
-      name: "og-cover-svg-miss",
-      seedKV: {},
-      request: GET("/og-cover.svg?id=d3cb8b17"),
-      stub: null,
-      post: async () => ({}),
-    },
-    {
       name: "og-icon-png",
       seedKV: {},
       request: GET("/og-icon.png"),

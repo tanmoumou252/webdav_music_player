@@ -1412,35 +1412,6 @@
       "sourcesLen": 1
     }
   },
-  "og-cover-svg-hit": {
-    "status": 200,
-    "statusText": "",
-    "headers": {
-      "access-control-allow-headers": "*",
-      "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-      "access-control-allow-origin": "*",
-      "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-      "cache-control": "public, max-age=86400",
-      "content-type": "image/svg+xml; charset=utf-8"
-    },
-    "body": "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"630\" viewBox=\"0 0 1200 630\"><defs><linearGradient id=\"g\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\"><stop offset=\"0\" stop-color=\"#0d1117\"/><stop offset=\"1\" stop-color=\"#14301b\"/></linearGradient></defs><rect width=\"1200\" height=\"630\" fill=\"url(#g)\"/><g transform=\"translate(120 171) scale(12)\" fill=\"#1ed760\"><path d=\"M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z\"/></g><text x=\"480\" y=\"290\" font-family=\"Segoe UI,sans-serif\" font-size=\"56\" fill=\"#ffffff\">Title</text><text x=\"480\" y=\"360\" font-family=\"Segoe UI,sans-serif\" font-size=\"36\" fill=\"#9aa4b2\">Artist</text></svg>",
-    "stubCalls": [],
-    "post": {}
-  },
-  "og-cover-svg-miss": {
-    "status": 404,
-    "statusText": "",
-    "headers": {
-      "access-control-allow-headers": "*",
-      "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-      "access-control-allow-origin": "*",
-      "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-      "content-type": "text/plain; charset=utf-8"
-    },
-    "body": "Not Found",
-    "stubCalls": [],
-    "post": {}
-  },
   "og-icon-png": {
     "status": 200,
     "statusText": "",
@@ -1453,8 +1424,8 @@
       "content-type": "image/png"
     },
     "body": {
-      "binLen": 5753,
-      "sha256": "af62a7987cbe963209eb19106ce92b7d252ff3c69dd6953ceeb1db32e689c12a"
+      "binLen": 3413,
+      "sha256": "3cdfb30483b96f7e9d9bdf59aee66a1723f2a446a8014de12b95f64564ae426d"
     },
     "stubCalls": [],
     "post": {}
@@ -1486,8 +1457,8 @@
       "content-type": "image/png"
     },
     "body": {
-      "binLen": 5753,
-      "sha256": "af62a7987cbe963209eb19106ce92b7d252ff3c69dd6953ceeb1db32e689c12a"
+      "binLen": 3413,
+      "sha256": "3cdfb30483b96f7e9d9bdf59aee66a1723f2a446a8014de12b95f64564ae426d"
     },
     "stubCalls": [],
     "post": {}

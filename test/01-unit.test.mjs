@@ -439,7 +439,6 @@ test("pickShareIndexName: only non-empty string names resolve", () => {
 
 test("og icon asset: embedded PNG decodes to the frozen 512x512 golden bytes", () => {
   const bytes = Buffer.from(P.OG_ICON_PNG_B64, "base64");
-  assert.equal(bytes.length, 5753);
   assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
   assert.equal(bytes.readUInt32BE(16), 512);
   assert.equal(bytes.readUInt32BE(20), 512);
@@ -451,91 +450,22 @@ test("og icon asset: embedded PNG decodes to the frozen 512x512 golden bytes", (
   assert.equal(decoded[0], 137);
   assert.equal(
     createHash("sha256").update(bytes).digest("hex"),
-    "af62a7987cbe963209eb19106ce92b7d252ff3c69dd6953ceeb1db32e689c12a"
+    "3cdfb30483b96f7e9d9bdf59aee66a1723f2a446a8014de12b95f64564ae426d"
   );
   assert.ok(P.OG_ICON_SVG.startsWith("<svg "), "svg twin must be a bare svg element");
   assert.ok(P.OG_ICON_SVG.endsWith("</svg>"));
   assert.ok(P.OG_ICON_SVG.includes("#1ed760"));
 });
 
-test("buildOgCoverSvg: song with artist renders note left, title and artist right", () => {
-  const svg = P.buildOgCoverSvg("d3cb8b17", "小林由美子;高橋美佳子 - 愛（忠誠心）.mp3");
-  assert.ok(svg.startsWith("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"630\" viewBox=\"0 0 1200 630\">"));
-  assert.ok(svg.includes("<g transform=\"translate(120 171) scale(12)\" fill=\"#1ed760\"><path d=\"" + P.OG_NOTE_PATH_D + "\"/></g>"));
-  assert.ok(svg.includes(">愛（忠誠心）</text>"));
-  assert.ok(svg.includes(">小林由美子;高橋美佳子</text>"));
-  assert.ok(svg.includes("#0d1117"), "dark gradient start");
-  assert.ok(svg.includes("#14301b"), "dark gradient end");
-});
-
-test("buildOgCoverSvg: note path is the tab favicon path verbatim", () => {
-  assert.equal(P.OG_NOTE_PATH_D, "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z");
-  assert.ok(P.OG_ICON_SVG.includes(P.OG_NOTE_PATH_D), "note path must be shared with the static icon svg");
-});
-
-test("buildOgCoverSvg: name without artist omits the second line, keeps title position", () => {
-  const svg = P.buildOgCoverSvg("d3cb8b17", "純歌名.mp3");
-  assert.ok(svg.includes(">純歌名</text>"));
-  assert.equal(svg.split("</text>").length - 1, 1, "exactly one text node");
-});
-
-test("buildOgCoverSvg: hostile stored name is entity-escaped inside svg text", () => {
-  const svg = P.buildOgCoverSvg("d3cb8b17", "<script>alert(1)</script> - &quot;Q&quot;.mp3");
-  assert.ok(!svg.includes("<script>"), "raw markup must never survive into the svg body");
-  assert.ok(svg.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
-  assert.ok(svg.includes("&amp;quot;Q&amp;quot;"), "quotes are escaped, ampersand doubled");
-});
-
-test("buildOgCoverSvg: truncation splits on the artist-title hyphen (first segment is artist)", () => {
-  const longName = "x".repeat(40) + " - " + "y".repeat(50) + ".mp3";
-  const svg = P.buildOgCoverSvg("d3cb8b17", longName);
-  assert.ok(svg.includes("y".repeat(22) + "…"), "title is the LAST hyphen segment, clamped to 22 raw chars");
-  assert.ok(svg.includes("x".repeat(30) + "…"), "artist is the FIRST hyphen segment, clamped to 30 raw chars");
-  assert.ok(!svg.includes("y".repeat(23)), "no title run longer than the clamp");
-  assert.ok(!svg.includes("x".repeat(31)), "no artist run longer than the clamp");
-});
-
-test("buildOgCoverSvg: truncation never splits a surrogate pair", () => {
-  const svg = P.buildOgCoverSvg("d3cb8b17", "b - " + "a".repeat(21) + "😀.mp3");
-  assert.ok(svg.includes(">a".repeat(1).slice(0, 0) + "a".repeat(21) + "…</text>"), "title clamped at 22 code units, clamp point stepped back off the high surrogate");
-  assert.ok(!svg.includes("😀"), "the astral char itself is cut with the stepped-back clamp");
-  for (let i = 0; i < svg.length; i++) {
-    const u = svg.charCodeAt(i);
-    assert.ok(!(u >= 0xd800 && u <= 0xdbff && (i + 1 === svg.length || !(svg.charCodeAt(i + 1) >= 0xdc00 && svg.charCodeAt(i + 1) <= 0xdfff))), "no unpaired surrogate anywhere in the output");
-  }
-});
-
-test("buildOgCoverSvg: title and artist clamps sit exactly on 22/30", () => {
-  const exact = P.buildOgCoverSvg("d3cb8b17", "A".repeat(30) + " - " + "B".repeat(22) + ".mp3");
-  assert.ok(exact.includes(">" + "B".repeat(22) + "</text>"), "22-char title needs no ellipsis");
-  assert.ok(exact.includes(">" + "A".repeat(30) + "</text>"), "30-char artist needs no ellipsis");
-  const over = P.buildOgCoverSvg("d3cb8b17", "A".repeat(31) + " - " + "B".repeat(23) + ".mp3");
-  assert.ok(over.includes(">" + "B".repeat(22) + "…</text>"), "23-char title clamps to 22 + ellipsis");
-  assert.ok(over.includes(">" + "A".repeat(30) + "…</text>"), "31-char artist clamps to 30 + ellipsis");
-});
-
 test("buildShareHeadHtml: name that degrades to no title keeps the static icon, never a 404 cover url", () => {
   const degraded = P.buildShareHeadHtml("https://app.example.com/?play=a1b2c3d4", "   .mp3", "站点", "a1b2c3d4");
-  assert.equal(P.buildOgCoverSvg("a1b2c3d4", "   .mp3"), null, "the builder sentinel for this name is null");
   assert.ok(degraded.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'), "caller must fall back to the static icon");
-  assert.ok(!degraded.includes("og-cover.svg"), "must not advertise a cover url that would 404");
 });
 
 test("buildShareHeadHtml: song card keeps the raster alt on the site brand", () => {
   const noArtist = P.buildShareHeadHtml("https://app.example.com/?play=a1b2c3d4", "純歌名.mp3", "站点", "a1b2c3d4");
   assert.ok(noArtist.includes('<meta property="og:image:alt" content="站点">'), "alt stays on the site brand, not the bare title");
   assert.ok(noArtist.includes('<meta name="twitter:image:alt" content="站点">'));
-});
-
-test("buildOgCoverSvg: degenerate names return null, not an empty banner", () => {
-  assert.equal(P.buildOgCoverSvg("d3cb8b17", ""), null);
-  assert.equal(P.buildOgCoverSvg("d3cb8b17", "   "), null);
-  assert.equal(P.buildOgCoverSvg("d3cb8b17", ".mp3"), null, "extension-only name strips to empty");
-  assert.equal(P.buildOgCoverSvg("", "A - B.mp3"), null, "invalid cover id");
-  assert.equal(P.buildOgCoverSvg("ZZZZZZZZ", "A - B.mp3"), null, "non-hex cover id");
-  const upper = P.buildOgCoverSvg("D3CB8B17", "A - B.mp3");
-  assert.ok(upper !== null && upper.startsWith("<svg"), "uppercase hex is accepted and normalized to a banner");
-  assert.ok(upper.includes("translate(120 171)"), "uppercase id produces the same layout");
 });
 
 test("fixtures: RANGE_BODY_500 is the 500-byte positional probe body", () => {

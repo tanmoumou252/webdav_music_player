@@ -126,53 +126,12 @@ test("og icon routes: png bytes are byte-identical on /og-icon.png and /favicon.
   assert.equal(png.headers.get("cache-control"), "public, max-age=604800");
   const pngBytes = Buffer.from(await png.arrayBuffer());
   const icoBytes = Buffer.from(await ico.arrayBuffer());
-  assert.equal(pngBytes.length, 5753);
+  assert.equal(pngBytes.length, 3413);
   assert.ok(pngBytes.equals(icoBytes));
   assert.equal(
     createHash("sha256").update(pngBytes).digest("hex"),
-    "af62a7987cbe963209eb19106ce92b7d252ff3c69dd6953ceeb1db32e689c12a"
+    "3cdfb30483b96f7e9d9bdf59aee66a1723f2a446a8014de12b95f64564ae426d"
   );
-});
-
-test("og cover route: valid id renders the banner svg with note and song text", async () => {
-  const rec = await runOne(scenarioNamed("og-cover-svg-hit"), worker);
-  assert.equal(rec.status, 200);
-  assert.equal(rec.headers["content-type"], "image/svg+xml; charset=utf-8");
-  assert.equal(rec.headers["cache-control"], "public, max-age=86400");
-  assert.ok(rec.body.includes("translate(120 171) scale(12)"));
-  assert.ok(rec.body.includes(">Title</text>"), "display title, extension stripped");
-  assert.ok(rec.body.includes(">Artist</text>"));
-});
-
-test("og cover route: invalid or unresolvable id is a 404, never an svg or a 500", async () => {
-  const rec = await runOne(scenarioNamed("og-cover-svg-miss"), worker);
-  assert.equal(rec.status, 404);
-  assert.ok(!rec.body.includes("<svg"));
-  const bad = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/og-cover.svg?id=../../etc" }), { MUSIC_KV: createKV({}) });
-  assert.equal(bad.status, 404);
-  const upper = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/og-cover.svg?id=D3CB8B17" }), { MUSIC_KV: createKV({ cache_v3_list_all: JSON.stringify({ items: [{ id: "d3cb8b17", name: "A - B.mp3" }] }) }) });
-  assert.equal(upper.status, 200, "uppercase hex normalizes to the same song");
-});
-
-test("og cover route: unresolvable id answers 404 with no cache-control so platforms own negative caching", async () => {
-  const rec = await runOne(scenarioNamed("og-cover-svg-miss"), worker);
-  assert.equal(rec.status, 404);
-  assert.equal(rec.headers["cache-control"], undefined, "the 404 branch carries no Cache-Control (contract C negative-cache declaration)");
-});
-
-test("og cover route: a kv read failure degrades to 404, never a 5xx", async () => {
-  const env = {
-    MUSIC_KV: {
-      get: async () => { throw new Error("kv boom"); },
-      put: async () => {},
-      delete: async () => {},
-      list: async () => ({ keys: [] }),
-    },
-  };
-  const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/og-cover.svg?id=d3cb8b17" }), env);
-  assert.equal(res.status, 404, "the try/catch guard must swallow kv failures into a 404, not leak a 500");
-  const text = await res.text();
-  assert.ok(!text.includes("<svg"));
 });
 
 test("share head: the v and id query entries drive the same resolved song card as play", async () => {
@@ -183,19 +142,6 @@ test("share head: the v and id query entries drive the same resolved song card a
   const byId = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/?id=a1b2c3d4" }), { MUSIC_KV: createKV({ site_title: "分享站", cache_v3_list_all: JSON.stringify({ items: [{ id: "a1b2c3d4", name: "Artist - Title.mp3" }] }) }) });
   const bodyId = await byId.text();
   assert.ok(bodyId.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'), "?id= must resolve the song and advertise the raster image");
-});
-
-test("og cover route: invalid id short-circuits with zero kv reads", async () => {
-  const env = { MUSIC_KV: createKV({}) };
-  let reads = 0;
-  const originalGet = env.MUSIC_KV.get.bind(env.MUSIC_KV);
-  env.MUSIC_KV.get = async (key, opts) => {
-    reads++;
-    return originalGet(key, opts);
-  };
-  const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/og-cover.svg?id=zzzzzzzz" }), env);
-  assert.equal(res.status, 404);
-  assert.equal(reads, 0, "id whitelist must reject before any kv read (ledger class: kv read amplification)");
 });
 
 test("share head: song page with play id serves the raster social image and restored description", async () => {
