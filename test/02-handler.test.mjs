@@ -1,890 +1,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { scenarios, runOne } from "./helper/scenarios.mjs";
-import { comparable } from "./helper/harness.mjs";
+import { createHash } from "node:crypto";
+import { scenarios, runOne, scenarioNamed, contains, bodyJson } from "./helper/scenarios.mjs";
+import { comparable, makeRequest, FROZEN_NOW } from "./helper/harness.mjs";
+import { createKV } from "./helper/kv.mjs";
 import worker from "../build/out/worker.check.mjs";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import * as F from "./helper/fixtures.mjs";
 
-// Tier-2 全路由特征化测试：golden 钉死现状行为。
+// Tier-2 全路由特征化测试：golden 外置到 test/golden/handler-scenarios.json。
 // import 目标为构建产物 build/out/worker.check.mjs，仍绿即证明切片与拼接零行为回归。
-export const GOLDEN = {
- "options": {
-  "status": 204,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges"
-  },
-  "body": "",
-  "stubCalls": [],
-  "post": {}
- },
- "nokv": {
-  "status": 500,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain; charset=utf-8"
-  },
-  "body": "请在 Worker 设置中绑定变量名为 MUSIC_KV 的 KV 命名空间！",
-  "stubCalls": [],
-  "post": {}
- },
- "jsmediatags-ok": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "cache-control": "public, max-age=604800",
-   "content-type": "application/javascript; charset=utf-8"
-  },
-  "body": "/* jsmediatags 3.9.5 fake payload */",
-  "stubCalls": [
-   {
-    "url": "https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js",
-    "method": "GET",
-    "headers": {}
-   }
-  ],
-  "post": {}
- },
- "jsmediatags-down": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/javascript"
-  },
-  "body": "// jsmediatags unavailable",
-  "stubCalls": [
-   {
-    "url": "https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js",
-    "method": "GET",
-    "headers": {}
-   }
-  ],
-  "post": {}
- },
- "status-uninit": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"isInitialized\":false,\"isAdmin\":false,\"title\":\"我的多源音乐库\",\"sources\":[]}",
-  "stubCalls": [],
-  "post": {}
- },
- "status-init-guest": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"isInitialized\":false,\"isAdmin\":false,\"title\":\"我的多源音乐库\",\"sources\":[{\"id\":\"a\",\"name\":\"源A\"}]}",
-  "stubCalls": [],
-  "post": {}
- },
- "status-admin-cookie": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"isInitialized\":true,\"isAdmin\":true,\"title\":\"我的多源音乐库\",\"sources\":[{\"id\":\"a\",\"name\":\"源A\"}]}",
-  "stubCalls": [],
-  "post": {}
- },
- "init-first": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json",
-   "set-cookie": "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000",
-   "set-cookie[]": [
-    "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000"
-   ]
-  },
-  "body": "{\"success\":true}",
-  "stubCalls": [],
-  "post": {
-   "adminPassCount1": true,
-   "siteTitle": "我的站"
-  }
- },
- "init-twice": {
-  "status": 400,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"已初始化\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "init-short-pass": {
-  "status": 400,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"密码长度至少 8 位\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "init-no-pass": {
-  "status": 400,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"密码必填\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "login-ok": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json",
-   "set-cookie": "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000",
-   "set-cookie[]": [
-    "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000"
-   ]
-  },
-  "body": "{\"success\":true}",
-  "stubCalls": [],
-  "post": {
-   "rl": null,
-   "sessionCount": 2
-  }
- },
- "login-bad": {
-  "status": 403,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"密码错误\"}",
-  "stubCalls": [],
-  "post": {
-   "rl": "1"
-  }
- },
- "login-lockout": {
-  "status": 429,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8",
-   "retry-after": "600"
-  },
-  "body": "{\"error\":\"尝试过于频繁，请 10 分钟后再试\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "login-plaintext-upgrade": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json",
-   "set-cookie": "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000",
-   "set-cookie[]": [
-    "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000"
-   ]
-  },
-  "body": "{\"success\":true}",
-  "stubCalls": [],
-  "post": {
-   "upgradedHashLen": 64,
-   "upgradedIsHex64": true
-  }
- },
- "sources-get-guest": {
-  "status": 403,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"未授权\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "sources-get-admin": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "[{\"id\":\"a\",\"name\":\"源A\",\"url\":\"https://dav.example.com/dav/\",\"user\":\"u1\",\"pass\":\"p1\"},{\"id\":\"b\",\"name\":\"源B\",\"url\":\"https://dav.example.net/dav\",\"user\":\"u2\",\"pass\":\"päss\"}]",
-  "stubCalls": [],
-  "post": {}
- },
- "sources-post-invalid-url": {
-  "status": 400,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"源配置无效：url 必须为 http/https 且格式合法\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "sources-post-valid": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"success\":true}",
-  "stubCalls": [],
-  "post": {
-   "cacheKeys": 0,
-   "sourcesLen": 2,
-   "siteTitle": "新标题"
-  }
- },
- "sources-post-newpass": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json",
-   "set-cookie": "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000",
-   "set-cookie[]": [
-    "admin_token=<TOKEN>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=2592000"
-   ]
-  },
-  "body": "{\"success\":true}",
-  "stubCalls": [],
-  "post": {
-   "sessionCount": 1,
-   "passIsNewHex": true,
-   "passIsOld": false,
-   "cacheKeys": 0
-  }
- },
- "sources-post-newpass-short": {
-  "status": 400,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "text/plain;charset=UTF-8"
-  },
-  "body": "{\"error\":\"新密码长度至少 8 位\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "logout": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json",
-   "set-cookie": "admin_token=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0",
-   "set-cookie[]": [
-    "admin_token=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0"
-   ]
-  },
-  "body": "{\"success\":true}",
-  "stubCalls": [],
-  "post": {
-   "sessionCount": 0
-  }
- },
- "list-empty": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"items\":[],\"debugs\":[]}",
-  "stubCalls": [],
-  "post": {}
- },
- "list-single-admin": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[{\"name\":\"Alpha - One.mp3\",\"href\":\"/dav/Alpha%20-%20One.mp3\",\"id\":\"93f8adb4\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/dav/Alpha%20-%20One.mp3\"}]},{\"name\":\"Beta & Band - Two.flac\",\"href\":\"/dav/Beta%20&%20Band%20-%20Two.flac\",\"id\":\"d0bc3107\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/dav/Beta%20&%20Band%20-%20Two.flac\"}]}],\"debugs\":[{\"sourceId\":\"a\",\"sourceName\":\"源A\",\"targetUrl\":\"https://dav.example.com/dav/\",\"status\":207,\"statusText\":\"Multi-Status\",\"contentType\":\"application/xml\",\"allHrefs\":[\"/dav/\",\"/dav/Alpha%20-%20One.mp3\",\"/dav/Beta%20&amp;%20Band%20-%20Two.flac\"],\"allHrefsCount\":3,\"rawPreview\":\"<?xml version=\\\"1.0\\\" encoding=\\\"utf-8\\\"?>\\n<d:multistatus xmlns:d=\\\"DAV:\\\">\\n<d:response>\\n<d:href>/dav/</d:href>\\n<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>Music</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\\n</d:response>\\n<d:response>\\n<d:h\",\"rawLength\":747}],\"diagnostics\":null,\"fromCache\":false,\"isAdmin\":true}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {
-   "cached": true
-  }
- },
- "list-single-guest": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[{\"name\":\"Alpha - One.mp3\",\"href\":\"/dav/Alpha%20-%20One.mp3\",\"id\":\"93f8adb4\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/dav/Alpha%20-%20One.mp3\"}]},{\"name\":\"Beta & Band - Two.flac\",\"href\":\"/dav/Beta%20&%20Band%20-%20Two.flac\",\"id\":\"d0bc3107\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/dav/Beta%20&%20Band%20-%20Two.flac\"}]}],\"debugs\":[],\"diagnostics\":null,\"fromCache\":false,\"isAdmin\":false}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {
-   "cached": true
-  }
- },
- "list-all-merge": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[{\"name\":\"Alpha - One.mp3\",\"href\":\"/dav/Alpha%20-%20One.mp3\",\"id\":\"93f8adb4\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/dav/Alpha%20-%20One.mp3\"},{\"sourceId\":\"b\",\"href\":\"/dwb/Alpha - One.mp3\"}]},{\"name\":\"Beta & Band - Two.flac\",\"href\":\"/dav/Beta%20&%20Band%20-%20Two.flac\",\"id\":\"d0bc3107\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/dav/Beta%20&%20Band%20-%20Two.flac\"}]},{\"name\":\"Gamma <live>.m4a\",\"href\":\"/dwb/Gamma%20<live>.m4a\",\"id\":\"17e2b518\",\"availableNodes\":[{\"sourceId\":\"b\",\"href\":\"/dwb/Gamma%20<live>.m4a\"}]}],\"debugs\":[{\"sourceId\":\"a\",\"sourceName\":\"源A\",\"targetUrl\":\"https://dav.example.com/dav/\",\"status\":207,\"statusText\":\"Multi-Status\",\"contentType\":\"application/xml\",\"allHrefs\":[\"/dav/\",\"/dav/Alpha%20-%20One.mp3\",\"/dav/Beta%20&amp;%20Band%20-%20Two.flac\"],\"allHrefsCount\":3,\"rawPreview\":\"<?xml version=\\\"1.0\\\" encoding=\\\"utf-8\\\"?>\\n<d:multistatus xmlns:d=\\\"DAV:\\\">\\n<d:response>\\n<d:href>/dav/</d:href>\\n<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:displayname>Music</d:displayname></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>\\n</d:response>\\n<d:response>\\n<d:h\",\"rawLength\":747},{\"sourceId\":\"b\",\"sourceName\":\"源B\",\"targetUrl\":\"https://dav.example.net/dav/\",\"status\":207,\"statusText\":\"Multi-Status\",\"contentType\":\"application/xml\",\"allHrefs\":[\"/dwb/\",\"/dwb/Alpha - One.mp3\",\"/dwb/Gamma%20&lt;live&gt;.m4a\",\"/dwb/readme.txt\"],\"allHrefsCount\":4,\"rawPreview\":\"<?xml version=\\\"1.0\\\" encoding=\\\"utf-8\\\"?>\\n<D:multistatus xmlns:D=\\\"DAV:\\\">\\n<D:response>\\n<D:href>/dwb/</D:href>\\n<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\\n</D:response>\\n<D:response>\\n<D:href>/dwb/Alpha - One.mp3</D:href>\\n<D\",\"rawLength\":849}],\"diagnostics\":null,\"fromCache\":false,\"isAdmin\":true}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "depth": "1"
-    }
-   },
-   {
-    "url": "https://dav.example.net/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTI6cMOkc3M=",
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {
-   "cachedAll": true
-  }
- },
- "list-cache-hit-guest": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[{\"id\":\"a1b2c3d4\",\"name\":\"Alpha - One.mp3\",\"href\":\"/da/Alpha%20-%20One.mp3\",\"availableNodes\":[{\"sourceId\":\"a\",\"href\":\"/da/x.mp3\"}]}],\"debugs\":[],\"diagnostics\":null,\"fromCache\":true,\"isAdmin\":false,\"notice\":\"部分源暂不可用（详情仅管理员可见）\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "list-cache-hit-admin": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[{\"id\":\"a1b2c3d4\",\"name\":\"Beta & Band - Two.flac\",\"href\":\"/da/b.flac\",\"availableNodes\":[{\"sourceId\":\"b\",\"href\":\"/da/b.flac\"}]}],\"debugs\":[\"dbg1\"],\"diagnostics\":[{\"title\":\"x\",\"timestamp\":\"<TS>\"}],\"fromCache\":true,\"isAdmin\":true}",
-  "stubCalls": [],
-  "post": {}
- },
- "list-refresh-cooldown": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[{\"id\":\"a1b2c3d4\",\"name\":\"Z - Z.mp3\",\"href\":\"/z.mp3\"}],\"debugs\":[],\"diagnostics\":null,\"fromCache\":true,\"isAdmin\":true,\"notice\":\"刚刚已完成同步，网盘处于冷却期（请30秒后再试）\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "list-no-source-admin": {
-  "status": 404,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"error\":\"指定的源不存在\",\"diagnostic\":{\"title\":\"配置源丢失\",\"cause\":\"ID zzz 未找到\",\"solution\":\"请在设置中检查源配置。\"},\"items\":[]}",
-  "stubCalls": [],
-  "post": {}
- },
- "list-waf-admin": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[],\"debugs\":[{\"sourceId\":\"e\",\"sourceName\":\"坏源\",\"targetUrl\":\"https://err.example.com/dav/\",\"status\":403,\"statusText\":\"Forbidden\",\"contentType\":\"text/plain\",\"allHrefs\":[],\"allHrefsCount\":0,\"rawPreview\":\"Access for this IP has been blocked by the security system\",\"rawLength\":58}],\"diagnostics\":[{\"sourceName\":\"坏源\",\"status\":403,\"statusText\":\"Forbidden\",\"method\":\"PROPFIND\",\"targetUrl\":\"https://err.example.com/dav/\",\"contentType\":\"text/plain\",\"bodyPreview\":\"Access for this IP has been blocked by the security system\",\"title\":\"源【坏源】触发了网盘服务端的临时 IP 频控拦截 (403 WAF)\",\"cause\":\"网盘服务端（如 Koofr 安全策略）侦测到来自当前 Cloudflare 机房节点的短时请求较多，触发了防刷机制。\",\"solution\":\"请勿连续频繁刷新。正常使用时系统已开启 KV 集中缓存保护网盘，通常等待 1~2 分钟即可自动解封恢复。\",\"timestamp\":\"<TS>\"}],\"fromCache\":false,\"isAdmin\":true}",
-  "stubCalls": [
-   {
-    "url": "https://err.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {}
- },
- "list-html-page": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"items\":[],\"debugs\":[{\"sourceId\":\"a\",\"sourceName\":\"源A\",\"targetUrl\":\"https://dav.example.com/dav/\",\"status\":200,\"statusText\":\"OK\",\"contentType\":\"text/html; charset=utf-8\",\"allHrefs\":[],\"allHrefsCount\":0,\"rawPreview\":\"<!DOCTYPE html>\\n<html><head><title>Login</title></head><body>Please sign in</body></html>\",\"rawLength\":89}],\"diagnostics\":[{\"sourceName\":\"源A\",\"status\":200,\"statusText\":\"OK\",\"method\":\"PROPFIND\",\"targetUrl\":\"https://dav.example.com/dav/\",\"contentType\":\"text/html; charset=utf-8\",\"bodyPreview\":\"<!DOCTYPE html>\\n<html><head><title>Login</title></head><body>Please sign in</body></html>\",\"title\":\"源【源A】端点返回了网页而非 WebDAV\",\"cause\":\"请求返回了 HTTP 200，但响应内容是普通 HTML 网页，并非 WebDAV 数据。\",\"solution\":\"请确认 WebDAV 地址是否正确，不能填管理面板前端网页网址。\",\"timestamp\":\"<TS>\"}],\"fromCache\":false,\"isAdmin\":true}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {}
- },
- "list-crash-admin": {
-  "status": 500,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"error\":\"broken response body\",\"diagnostic\":{\"title\":\"Worker 执行异常\",\"cause\":\"<STACK>\",\"solution\":\"请检查后台配置。\"},\"items\":[]}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {}
- },
- "list-crash-guest": {
-  "status": 500,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"error\":\"服务繁忙，请稍后再试\",\"items\":[]}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/",
-    "method": "PROPFIND",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "depth": "1"
-    }
-   }
-  ],
-  "post": {}
- },
- "stream-missing-params": {
-  "status": 400,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json"
-  },
-  "body": "{\"error\":\"缺少源或路径参数\"}",
-  "stubCalls": [],
-  "post": {}
- },
- "stream-absolute-url-guest": {
-  "status": 403,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"访问被拒绝\",\"diagnostic\":null}",
-  "stubCalls": [],
-  "post": {}
- },
- "stream-path-escape-admin": {
-  "status": 403,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"访问被拒绝：路径校验未通过\",\"diagnostic\":{\"sourceName\":\"源A\",\"status\":403,\"statusText\":\"Path validation rejected\",\"method\":\"GET\",\"targetUrl\":\"https://dav.example.com/dav/../secret.mp3\",\"contentType\":\"\",\"bodyPreview\":\"\",\"title\":\"访问被拒绝：路径校验未通过\",\"cause\":\"file 参数必须是所配置源目录内的相对路径；绝对 URL 与目录逃逸一律拒绝。\",\"solution\":\"请从正常歌曲列表播放；手动构造链接时使用列表返回的相对 href。\",\"timestamp\":\"<TS>\"}}",
-  "stubCalls": [],
-  "post": {}
- },
- "stream-not-audio": {
-  "status": 403,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"访问被拒绝\",\"diagnostic\":null}",
-  "stubCalls": [],
-  "post": {}
- },
- "stream-ok": {
-  "status": 206,
-  "statusText": "Partial Content",
-  "headers": {
-   "accept-ranges": "bytes",
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-length": "100",
-   "content-range": "bytes 0-99/100",
-   "content-type": "audio/mpeg"
-  },
-  "body": "AUDIODATA",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
-    "method": "GET",
-    "headers": {
-     "authorization": "Basic dTE6cDE=",
-     "range": "bytes=0-99"
-    }
-   }
-  ],
-  "post": {}
- },
- "stream-ok-norange": {
-  "status": 200,
-  "statusText": "OK",
-  "headers": {
-   "accept-ranges": "bytes",
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-length": "9",
-   "content-type": "audio/mpeg"
-  },
-  "body": "AUDIODATA",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
-    "method": "GET",
-    "headers": {
-     "authorization": "Basic dTE6cDE="
-    }
-   }
-  ],
-  "post": {}
- },
- "stream-upstream-err-admin": {
-  "status": 404,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"源【源A】目标不存在 (404 Not Found)\",\"diagnostic\":{\"sourceName\":\"源A\",\"status\":404,\"statusText\":\"Not Found\",\"method\":\"GET\",\"targetUrl\":\"https://dav.example.com/dav/Alpha%20-%20One.mp3\",\"contentType\":\"\",\"bodyPreview\":\"Not Found\",\"title\":\"源【源A】目标不存在 (404 Not Found)\",\"cause\":\"请求的路径在 WebDAV 服务器上未找到。目标 URL: https://dav.example.com/dav/Alpha%20-%20One.mp3\",\"solution\":\"请检查 URL 路径大小写（Linux 严格区分大小写）或子路径是否有误。\",\"timestamp\":\"<TS>\"}}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
-    "method": "GET",
-    "headers": {
-     "authorization": "Basic dTE6cDE="
-    }
-   }
-  ],
-  "post": {}
- },
- "stream-upstream-err-guest": {
-  "status": 404,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"源站响应异常\",\"diagnostic\":null}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
-    "method": "GET",
-    "headers": {
-     "authorization": "Basic dTE6cDE="
-    }
-   }
-  ],
-  "post": {}
- },
- "stream-network-admin": {
-  "status": 502,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"源【源A】连接失败 (无法连通)\",\"diagnostic\":{\"sourceName\":\"源A\",\"status\":0,\"statusText\":\"connection refused\",\"method\":\"GET\",\"targetUrl\":\"https://dav.example.com/dav/Alpha%20-%20One.mp3\",\"contentType\":\"\",\"bodyPreview\":\"\",\"title\":\"源【源A】连接失败 (无法连通)\",\"cause\":\"Cloudflare 机房无法连通目标主机: connection refused。\",\"solution\":\"1. 请确认非 127.0.0.1 纯内网地址；2. 检查 DDNS 或端口映射。\",\"timestamp\":\"<TS>\"}}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
-    "method": "GET",
-    "headers": {
-     "authorization": "Basic dTE6cDE="
-    }
-   }
-  ],
-  "post": {}
- },
- "stream-network-guest": {
-  "status": 502,
-  "statusText": "",
-  "headers": {
-   "access-control-allow-headers": "*",
-   "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
-   "access-control-allow-origin": "*",
-   "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
-   "content-type": "application/json; charset=utf-8"
-  },
-  "body": "{\"error\":\"无法连通源站\",\"diagnostic\":null}",
-  "stubCalls": [
-   {
-    "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
-    "method": "GET",
-    "headers": {
-     "authorization": "Basic dTE6cDE="
-    }
-   }
-  ],
-  "post": {}
- },
- "html-root": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "cache-control": "no-store",
-   "content-security-policy": "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src-elem * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * https: http: data: blob:; media-src * data: blob: https: http:; img-src * data: blob: https: http:; style-src * 'unsafe-inline'; font-src * data: blob:;",
-   "content-type": "text/html; charset=utf-8"
-  },
-  "body": {
-   "htmlLen": 96415,
-   "sha256": "7d323f5a84861bd185c6a43123ffd590b0de11047e112350180b1d68ca518f7c"
-  },
-  "stubCalls": [],
-  "post": {}
- },
- "play-hit": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "cache-control": "no-store",
-   "content-security-policy": "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src-elem * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * https: http: data: blob:; media-src * data: blob: https: http:; img-src * data: blob: https: http:; style-src * 'unsafe-inline'; font-src * data: blob:;",
-   "content-type": "text/html; charset=utf-8"
-  },
-  "body": {
-   "htmlLen": 96925,
-   "sha256": "7b7919297d63209b1d4398c3e7e9981557471be5c8da8d44f132cf208cf6401f"
-  },
-  "stubCalls": [],
-  "post": {}
- },
- "play-uppercase": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "cache-control": "no-store",
-   "content-security-policy": "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src-elem * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * https: http: data: blob:; media-src * data: blob: https: http:; img-src * data: blob: https: http:; style-src * 'unsafe-inline'; font-src * data: blob:;",
-   "content-type": "text/html; charset=utf-8"
-  },
-  "body": {
-   "htmlLen": 96925,
-   "sha256": "3b547b0b891b487044d74995fb68913fb9a7824fc2da012bd668123362710a26"
-  },
-  "stubCalls": [],
-  "post": {}
- },
- "play-miss": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "cache-control": "no-store",
-   "content-security-policy": "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src-elem * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * https: http: data: blob:; media-src * data: blob: https: http:; img-src * data: blob: https: http:; style-src * 'unsafe-inline'; font-src * data: blob:;",
-   "content-type": "text/html; charset=utf-8"
-  },
-  "body": {
-   "htmlLen": 96415,
-   "sha256": "7d323f5a84861bd185c6a43123ffd590b0de11047e112350180b1d68ca518f7c"
-  },
-  "stubCalls": [],
-  "post": {}
- },
- "play-invalid-id": {
-  "status": 200,
-  "statusText": "",
-  "headers": {
-   "cache-control": "no-store",
-   "content-security-policy": "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src * 'unsafe-inline' 'unsafe-eval' data: blob:; script-src-elem * 'unsafe-inline' 'unsafe-eval' data: blob:; connect-src * https: http: data: blob:; media-src * data: blob: https: http:; img-src * data: blob: https: http:; style-src * 'unsafe-inline'; font-src * data: blob:;",
-   "content-type": "text/html; charset=utf-8"
-  },
-  "body": {
-   "htmlLen": 96415,
-   "sha256": "7d323f5a84861bd185c6a43123ffd590b0de11047e112350180b1d68ca518f7c"
-  },
-  "stubCalls": [],
-  "post": {}
- }
-};
-
+export const GOLDEN = JSON.parse(
+  readFileSync(join(fileURLToPath(new URL(".", import.meta.url)), "golden", "handler-scenarios.json"), "utf8")
+);
 
 for (const s of scenarios()) {
   test("handler:" + s.name, async () => {
@@ -893,8 +23,287 @@ for (const s of scenarios()) {
   });
 }
 
-test("coverage: every scenario has a golden record", () => {
-  for (const s of scenarios()) {
-    assert.ok(GOLDEN[s.name], "missing golden for " + s.name);
+test("share head: a throwing MUSIC_KV is swallowed fail-closed AND logged", async () => {
+  const req = makeRequest({ method: "GET", url: PAGE_URL + "/?play=a1b2c3d4" });
+  const boomEnv = { MUSIC_KV: { get: async () => { throw new Error("kv-down"); } } };
+  let logged = null;
+  const orig = console.error;
+  console.error = (...a) => { logged = a; };
+  let res;
+  let err;
+  try {
+    res = await worker.fetch(req, boomEnv);
+  } catch (e) {
+    err = e;
+  } finally {
+    console.error = orig;
   }
+  assert.equal(err, undefined, "a KV fault must not escape the page render");
+  assert.equal(res.status, 200, "a KV fault falls back to the generic card, never a 500");
+  assert.ok(logged !== null, "the swallowed fault must be logged (silent under an empty catch)");
+});
+
+test("coverage: golden records and scenarios are in exact 1:1 correspondence", () => {
+  const names = scenarios().map((s) => s.name);
+  for (const name of names) {
+    assert.ok(Object.prototype.hasOwnProperty.call(GOLDEN, name), "missing golden for " + name);
+  }
+  for (const name of Object.keys(GOLDEN)) {
+    assert.ok(names.includes(name), "stale golden record with no scenario: " + name);
+  }
+  assert.equal(Object.keys(GOLDEN).length, names.length, "record/scenario count drift");
+});
+
+const PAGE_URL = "https://app.example.com";
+
+test("share head: song variant injects raster og:image, restores description and swaps <title>", async () => {
+  const rec = await runOne(scenarioNamed("play-hit"), worker);
+  assert.ok(rec.body.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'));
+  assert.ok(rec.body.includes('<meta name="twitter:image" content="https://app.example.com/og-icon.png">'));
+  assert.ok(rec.body.includes('<meta name="twitter:card" content="summary">'));
+  assert.ok(rec.body.includes('<meta property="og:title" content="Artist - Title | 分享站">'));
+  assert.ok(rec.body.includes('<meta property="og:description" content="Artist - Title · 分享站">'), "song card restores description");
+  assert.ok(rec.body.includes('<meta property="og:url" content="https://app.example.com/?play=a1b2c3d4">'));
+  assert.ok(rec.body.includes("<title>Artist - Title | 分享站</title>"));
+  assert.ok(!rec.body.includes("<!--SHARE_HEAD-->"), "injection anchor must be consumed");
+  assert.ok(!rec.body.includes("<title>Cloud Music Hub</title>"), "default title must be replaced for a resolved song");
+});
+
+test("share head: durable index resolves the song after the list cache is gone", async () => {
+  const rec = await runOne(scenarioNamed("play-hit-index-fallback"), worker);
+  assert.ok(rec.body.includes("<title>Artist - Title | 分享站</title>"));
+  assert.ok(rec.body.includes('<meta property="og:type" content="music.song">'));
+});
+
+test("share head: unresolved id degrades to the generic website card", async () => {
+  const rec = await runOne(scenarioNamed("play-miss-no-index"), worker);
+  assert.ok(rec.body.includes('<meta property="og:type" content="website">'));
+  assert.ok(rec.body.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'));
+  assert.ok(rec.body.includes('<meta property="og:url" content="https://app.example.com/">'));
+  assert.ok(rec.body.includes("<title>Cloud Music Hub</title>"), "generic card must keep the default title");
+});
+
+test("share head: hostile stored name is entity-escaped, never raw markup", async () => {
+  const rec = await runOne(scenarioNamed("play-hit-xss"), worker);
+  assert.ok(rec.body.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+  assert.ok(rec.body.includes("&quot;Quote&quot;"));
+  assert.ok(!rec.body.includes("<script>alert(1)</script>"));
+});
+
+test("share head: every html page carries an absolute og image", async () => {
+  const rec = await runOne(scenarioNamed("html-root"), worker);
+  assert.ok(rec.body.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'));
+  assert.ok(!rec.body.includes("<!--SHARE_HEAD-->"));
+});
+
+test("share head: a rejecting site_title read degrades to the generic card, never 500", async () => {
+  const env = {
+    MUSIC_KV: {
+      get: async (key) => {
+        if (key === "site_title") throw new Error("kv unavailable");
+        return null;
+      },
+      put: async () => {},
+      delete: async () => {},
+      list: async () => ({ keys: [] }),
+    },
+  };
+  const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/" }), env);
+  assert.equal(res.status, 200, "a metadata read failure must never take the page down");
+  const body = await res.text();
+  assert.ok(body.includes('<meta property="og:type" content="website">'));
+  assert.ok(body.includes('<meta property="og:title" content="Cloud Music Hub">'));
+  assert.ok(body.includes("<title>Cloud Music Hub</title>"));
+  assert.ok(!body.includes("<!--SHARE_HEAD-->"));
+});
+
+test("og icon routes: png bytes are byte-identical on /og-icon.png and /favicon.ico", async () => {
+  const env = { MUSIC_KV: createKV({}) };
+  const png = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/og-icon.png" }), env);
+  const ico = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/favicon.ico" }), env);
+  assert.equal(png.status, 200);
+  assert.equal(png.headers.get("content-type"), "image/png");
+  assert.equal(png.headers.get("cache-control"), "public, max-age=604800");
+  const pngBytes = Buffer.from(await png.arrayBuffer());
+  const icoBytes = Buffer.from(await ico.arrayBuffer());
+  assert.equal(pngBytes.length, 3413);
+  assert.ok(pngBytes.equals(icoBytes));
+  assert.equal(
+    createHash("sha256").update(pngBytes).digest("hex"),
+    "3cdfb30483b96f7e9d9bdf59aee66a1723f2a446a8014de12b95f64564ae426d"
+  );
+});
+
+test("share head: the v and id query entries drive the same resolved song card as play", async () => {
+  const byV = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/?v=a1b2c3d4" }), { MUSIC_KV: createKV({ site_title: "分享站", cache_v3_list_all: JSON.stringify({ items: [{ id: "a1b2c3d4", name: "Artist - Title.mp3" }] }) }) });
+  const bodyV = await byV.text();
+  assert.ok(bodyV.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'), "?v= must resolve the song and advertise the raster image");
+  assert.ok(bodyV.includes('<meta name="twitter:card" content="summary">'));
+  const byId = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/?id=a1b2c3d4" }), { MUSIC_KV: createKV({ site_title: "分享站", cache_v3_list_all: JSON.stringify({ items: [{ id: "a1b2c3d4", name: "Artist - Title.mp3" }] }) }) });
+  const bodyId = await byId.text();
+  assert.ok(bodyId.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'), "?id= must resolve the song and advertise the raster image");
+});
+
+test("share head: song page with play id serves the raster social image and restored description", async () => {
+  const rec = await runOne(scenarioNamed("play-hit"), worker);
+  assert.ok(rec.body.includes('<meta property="og:image" content="https://app.example.com/og-icon.png">'));
+  assert.ok(rec.body.includes('<meta name="twitter:card" content="summary">'));
+  assert.ok(rec.body.includes('<meta property="og:description" content="Artist - Title · 分享站">'), "song page restores description");
+  assert.ok(rec.body.includes('<meta property="og:site_name" content="分享站">'), "song page restores site name");
+  assert.ok(rec.body.includes('<meta name="description" content="Artist'), "song page restores the non-og description tag");
+  assert.ok(rec.body.includes('<meta property="og:title" content="Artist - Title | 分享站">'), "song og:title keeps the brand suffix");
+  assert.ok(rec.body.includes("<title>Artist - Title | 分享站</title>"), "document title contract unchanged");
+});
+
+test("og icon route: /icon.svg serves the vector twin", async () => {
+  const env = { MUSIC_KV: createKV({}) };
+  const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/icon.svg" }), env);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "image/svg+xml; charset=utf-8");
+  const text = await res.text();
+  assert.ok(text.includes("#1ed760"));
+  assert.ok(text.includes("M12 3v10.55c"));
+});
+
+test("share index: per-source snapshot never clobbers another source's key", async () => {
+  const rec = await runOne(scenarioNamed("list-source-index-isolation"), worker);
+  assert.ok(Array.isArray(rec.post.indexA) && rec.post.indexA.length > 0, "source a's own key must be written");
+  assert.deepEqual(rec.post.indexB, [["beefbeef", "Untouched - ByB.mp3"]], "source b's key must be untouched byte-for-byte");
+});
+
+test("stream: an honest upstream 416 is passed through, never replaced by a JSON body", async () => {
+  const rec = await runOne(scenarioNamed("stream-upstream-416-passthrough"), worker);
+  assert.equal(rec.status, 416);
+  assert.equal(rec.headers["content-range"], "bytes */500");
+  assert.equal(rec.headers["content-type"], undefined, "no JSON diagnostic body may be attached");
+  assert.equal(rec.headers["content-length"], undefined);
+  assert.equal(rec.headers["accept-ranges"], undefined);
+  assert.equal(rec.body, "");
+});
+
+test("scenario text helpers reject summarized body objects with actionable errors", () => {
+  const binary = { name: "og-icon-png", body: { binLen: 5753, sha256: "abc" } };
+  const html = { name: "html-root", body: { htmlLen: 100, sha256: "def" } };
+  assert.throws(() => contains(binary, "PNG"), /contains\(\): expected a string body.*binary digest/);
+  assert.throws(() => bodyJson(binary), /bodyJson\(\): expected a string body.*binary digest/);
+  assert.throws(() => contains(html, "<html>"), /contains\(\): expected a string body.*html digest/);
+  assert.throws(() => bodyJson(html), /bodyJson\(\): expected a string body.*html digest/);
+  assert.equal(contains({ name: "plain", body: "hello world" }, "world"), true);
+  assert.deepEqual(bodyJson({ name: "json", body: "{\"ok\":true}" }), { ok: true });
+});
+
+test("stream: bytes=-N suffix is converted with the upstream length into a tail 206", async () => {
+  const rec = await runOne(scenarioNamed("stream-suffix-upstream-ignores-tail"), worker);
+  assert.equal(rec.status, 206);
+  assert.equal(rec.headers["content-range"], "bytes 200-499/500");
+  assert.equal(rec.headers["content-length"], "300");
+  assert.equal(rec.headers["accept-ranges"], "bytes");
+  const expectedTail = F.RANGE_BODY_500.slice(200);
+  assert.equal(rec.body.binLen, Buffer.byteLength(expectedTail, "utf8"));
+  assert.equal(rec.body.sha256, createHash("sha256").update(Buffer.from(expectedTail, "utf8")).digest("hex"));
+});
+
+test("stream: a suffix larger than the file returns the whole file as 206, never 416", async () => {
+  const rec = await runOne(scenarioNamed("stream-suffix-oversize-full"), worker);
+  assert.equal(rec.status, 206);
+  assert.equal(rec.headers["content-range"], "bytes 0-499/500");
+  assert.equal(rec.body.binLen, Buffer.byteLength(F.RANGE_BODY_500, "utf8"));
+  assert.equal(rec.body.sha256, createHash("sha256").update(Buffer.from(F.RANGE_BODY_500, "utf8")).digest("hex"));
+});
+
+test("share head: an orphaned index of a removed source is never consulted", async () => {
+  const rec = await runOne(scenarioNamed("play-hit-orphan-index"), worker);
+  assert.ok(rec.body.includes('<meta property="og:type" content="website">'), "must degrade to the generic card");
+  assert.ok(!rec.body.includes("Ghost - Song.mp3"), "the removed source's index must not resolve");
+});
+
+test("sources POST: removing a source deletes exactly that source's share index", async () => {
+  const rec = await runOne(scenarioNamed("sources-post-removes-index"), worker);
+  assert.equal(rec.status, 200);
+  assert.equal(rec.post.indexA, true);
+  assert.equal(rec.post.indexB, false);
+  assert.equal(rec.post.sourcesLen, 1);
+});
+
+test("share head: the source-targeted read side never performs a KV.list scan", async () => {
+  const env = {
+    MUSIC_KV: createKV({
+      site_title: "分享站",
+      dav_sources: JSON.stringify([F.SOURCE_A]),
+      share_meta_index_v1_a: JSON.stringify([["a1b2c3d4", "Artist - Title.mp3"]]),
+    }),
+  };
+  let listCalls = 0;
+  const originalList = env.MUSIC_KV.list.bind(env.MUSIC_KV);
+  env.MUSIC_KV.list = async (opts) => {
+    listCalls += 1;
+    return originalList(opts);
+  };
+  const res = await worker.fetch(makeRequest({ method: "GET", url: "https://app.example.com/?play=a1b2c3d4" }), env);
+  const body = await res.text();
+  assert.ok(body.includes("<title>Artist - Title | 分享站</title>"), "song name must resolve via the source-targeted read");
+  assert.equal(listCalls, 0, "the read side must not scan the whole index prefix");
+});
+
+test("sources POST: a removed source whose normalized key collides with a kept source gets its orphan index deleted", async () => {
+  const rec = await runOne(scenarioNamed("sources-post-key-collision"), worker);
+  assert.equal(rec.status, 200);
+  assert.equal(rec.post.oldIndexPresent, false, "the key was written by the removed source a.b; identity-based cleanup must delete it even though the normalized key collides with kept source ab (ab's own index is rewritten on next list scan)");
+  assert.equal(rec.post.sourcesLen, 1);
+});
+
+test("sources POST: a failing orphan-index delete cannot prevent the list-cache invalidation", async () => {
+  const env = {
+    MUSIC_KV: createKV({
+      admin_pass: F.ADMIN_HASH,
+      [`session_${"f".repeat(64)}`]: JSON.stringify({ created: FROZEN_NOW }),
+      dav_sources: JSON.stringify([F.SOURCE_A, F.SOURCE_B]),
+      share_meta_index_v1_b: JSON.stringify([["bbbbbbbb", "Drop - Me.mp3"]]),
+      cache_v3_list_all: "{}",
+      cache_v3_list_a: "{}",
+    }),
+  };
+  const originalDelete = env.MUSIC_KV.delete.bind(env.MUSIC_KV);
+  env.MUSIC_KV.delete = async (key) => {
+    if (typeof key === "string" && key.startsWith("share_meta_index_v1_")) throw new Error("kv delete boom");
+    return originalDelete(key);
+  };
+  let status = 0;
+  await worker.fetch(makeRequest({
+    method: "POST",
+    url: "https://app.example.com/api/admin/sources",
+    headers: { "content-type": "application/json", cookie: "admin_token=" + "f".repeat(64) },
+    body: JSON.stringify({ sources: [F.SOURCE_A] }),
+  }), env).then((r) => { status = r.status; }, () => { status = -1; });
+  const cacheKeys = (await env.MUSIC_KV.list({ prefix: "cache_v3_list_" })).keys.length;
+  assert.equal(status, 200, "a failing orphan-index delete must not abort the already-committed save");
+  assert.equal(cacheKeys, 0, "list-cache invalidation must already have run before the orphan delete");
+});
+
+test("stream Range: forwards identity encoding and never locally slices a content-encoded 200", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  let sawHeaders = null;
+  globalThis.fetch = async (_input, init) => {
+    sawHeaders = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    return new Response("COMPRESSEDBODY", { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "14", "content-encoding": "gzip" } });
+  };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3", headers: { range: "bytes=0-4" } }), env);
+    assert.equal(sawHeaders["accept-encoding"], "identity", "a forwarded Range request must pin identity encoding (Contract A trigger domain)");
+    assert.equal(res.status, 200, "a content-encoded 200 must pass through whole, never a fabricated 206 slice (Contract A non-trigger)");
+    assert.equal(res.headers.get("content-range"), null, "no Content-Range may ride on an unsliced full body");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream Range degraded passthrough: a content-encoded whole body carries no stale Accept-Ranges", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("COMPRESSEDBODY", { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "14", "content-encoding": "gzip", "accept-ranges": "bytes" } });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3", headers: { range: "bytes=0-4" } }), env);
+    assert.equal(res.status, 200, "the encoded 200 still passes through whole (Contract A non-trigger)");
+    assert.equal(res.headers.get("content-range"), null, "no fabricated Content-Range on the degraded response");
+    assert.equal(res.headers.get("accept-ranges"), null, "E2: a degraded whole-body response must not advertise Range support the very response refused to slice");
+  } finally { globalThis.fetch = prevFetch; }
 });

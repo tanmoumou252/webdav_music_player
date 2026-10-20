@@ -6,8 +6,12 @@ import { loadParts } from "./helper/load-parts.mjs";
 
 const { renderHTML } = loadParts();
 
-const GOLDEN_SHA256 = "7d323f5a84861bd185c6a43123ffd590b0de11047e112350180b1d68ca518f7c";
-const GOLDEN_LENGTH = 96415;
+function compactTemplate(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+const GOLDEN_SHA256 = "4552f6309eaeffb87f1a5a2712c6c0c5d6f891cb82817ef44a78121534a1d17f";
+const GOLDEN_LENGTH = 108409;
 
 test("Tier-3 renderHTML snapshot: golden length & sha256 master", () => {
   const html = renderHTML();
@@ -49,4 +53,156 @@ test("Tier-3 lock: client escapeHtml differs from server escapeHtmlText by desig
   assert.ok(html.includes("function escapeHtml(s) {"), "client escapeHtml function must be defined");
   assert.ok(html.includes("return String(s).replace(/&/g, '&amp;')"), "client escapeHtml implementation body");
   assert.ok(!html.includes("escapeHtmlText("), "server-only escapeHtmlText must never appear in client template");
+});
+
+test("Tier-3 mobile layout lock: no page scroll, dvh-capped cover, cover clears the floating buttons", () => {
+  const html = renderHTML();
+  const WIDE_ANCHOR = "@media (max-width: 768px)";
+  const SHORT_ANCHOR = "@media (max-height: 560px)";
+  const COMPACT_ANCHOR = "@media (max-width: 360px)";
+  const wideIdx = html.indexOf(WIDE_ANCHOR);
+  const shortIdx = html.indexOf(SHORT_ANCHOR);
+  const compactIdx = html.indexOf(COMPACT_ANCHOR);
+  assert.ok(wideIdx >= 0, "the wide-breakpoint media query must exist");
+  assert.ok(shortIdx >= 0, "the short-breakpoint media query must exist");
+  assert.ok(compactIdx >= 0, "the compact-breakpoint media query must exist");
+  assert.ok(wideIdx < shortIdx && shortIdx < compactIdx, "media queries must appear in wide -> short -> compact order");
+  const wide = html.slice(wideIdx, shortIdx);
+  assert.ok(wide.includes("overflow: hidden"), "mobile stage must not scroll the page");
+  assert.ok(wide.includes("justify-content: flex-start"), "flex-start keeps the cover below the floating buttons");
+  assert.ok(wide.includes("height: min(72vw, 300px, 42dvh)"), "cover height must be capped by dvh");
+  assert.ok(wide.includes("flex: 1 1 auto; min-height: 88px; height: auto"), "lyrics view must flex-shrink");
+  assert.ok(!wide.includes("height: min(38vh, 300px)"), "the fixed 38vh lyrics height must be gone");
+  const short = html.slice(shortIdx, compactIdx);
+  assert.ok(short.includes("height: min(48dvh, 40vw, 240px)"), "short-viewport cover cap must exist");
+  assert.ok(short.includes("overflow: hidden"), "short-viewport stage must not scroll either");
+
+  const widePad = /\.stage \{ display: flex; flex-direction: column;[^}]*padding: (\d+)px/.exec(wide);
+  const shortPad = /\.stage \{ display: flex; flex-direction: column;[^}]*padding: (\d+)px/.exec(short);
+  assert.ok(widePad && shortPad, "mobile .stage padding must stay parseable");
+  const BUTTON_ZONE = 16 + 38;
+  assert.ok(
+    Number(widePad[1]) > BUTTON_ZONE,
+    "cover top edge must sit strictly below the floating buttons: " + widePad[1] + " > " + BUTTON_ZONE
+  );
+  assert.ok(
+    Number(shortPad[1]) > BUTTON_ZONE,
+    "short-viewport cover top edge must clear the buttons too: " + shortPad[1] + " > " + BUTTON_ZONE
+  );
+});
+
+test("Tier-3 share head lock: anchor present, og tags injected not hardcoded", () => {
+  const html = renderHTML();
+  assert.ok(html.includes("<!--SHARE_HEAD-->"), "share head anchor must exist in the template");
+  assert.ok(!html.includes("og:image"), "og tags must be injected per request, never hardcoded");
+  assert.ok(html.includes('<audio id="audio" preload="metadata"></audio>'), "audio element must carry preload=metadata");
+});
+
+test("Tier-3 playback resilience lock: heartbeat watchdog, resume and tag cache wired", () => {
+  const html = renderHTML();
+  assert.ok(html.includes("function recoverPlayback()"));
+  assert.ok(html.includes("function stallHeartbeatTick()"));
+  assert.ok(html.includes("stallHeartbeat = window.setInterval(stallHeartbeatTick, STALL_HEARTBEAT_MS);"));
+  assert.ok(html.includes("if (!currentSongRef || userPaused || waitingForGesture || externallyPaused) return;"));
+  assert.ok(!html.includes("function armStallWatch"), "the event-armed watchdog must be fully replaced by the heartbeat");
+  assert.ok(html.includes("waitingForGesture = true;"));
+  assert.ok(html.includes("pendingSeek = lastKnownProgress(song);"));
+  assert.ok(html.includes("const PROGRESS_STORE_KEY = 'webdav_player_progress_v1';"));
+  assert.ok(html.includes("if (pendingSeek === null) pendingSeek = lastKnownProgress(song);"), "tryPlayFromNode:1415 backfill must stay — recoverPlayback:1740 next-mirror resume depends solely on it");
+  assert.ok(html.includes("function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false, resume = false) {"), "startPlayback must carry the trailing resume param after isAuto (guards A-9 形参序漂移)");
+  assert.ok(html.includes("forgetProgress(song);"), "the active-start (resume=false) branch must forget progress, not merely null pendingSeek");
+  assert.ok(html.includes("function parseShareTime(raw) {"), "share-time parser must exist (t=1m30s contract)");
+  assert.ok(html.includes("function formatShareTime(sec) {"), "share-time formatter must exist");
+  assert.ok(html.includes("let pendingShareSeek = null;"), "the one-shot share seek slot must exist");
+  assert.ok(html.includes("if (targetPlayId || legacySongName) pendingShareSeek = parseShareTime(urlParams.get('t'));"), "init must arm the share time only alongside a play target");
+  assert.ok(html.includes("'&t=' + stamp"), "the copy path must embed the stamp");
+  assert.ok(html.includes("let tagCache = new Map();"));
+  assert.ok(html.includes("async function parseAndCacheTags(song, url, token)"));
+  assert.ok(
+    compactTemplate(html).includes("const tags = await readEmbeddedTags(url); if (tags) { if (tagCache.has(key)) { const discardedCoverUrl = tags.coverUrl; if (discardedCoverUrl) URL.revokeObjectURL(discardedCoverUrl); } else { tagCache.set(key, tags); } trimTagCache(key, songKey(currentSongRef)); } if (token !== playToken) return;"),
+    "an existing tag-cache entry must win and an unused parsed cover blob must be released"
+  );
+  assert.ok(
+    !compactTemplate(html).includes("if (tags) { tagCache.set(key, tags); trimTagCache(key, songKey(currentSongRef)); }"),
+    "the unconditional tag-cache overwrite must stay gone"
+  );
+  assert.ok(
+    compactTemplate(html).includes("renderTags(tagCache.get(key) || tags, song.name);"),
+    "the current play must render the retained cache entry, never a discarded parse whose blob was revoked"
+  );
+  assert.ok(!html.includes("URL.revokeObjectURL(prevCover)"), "cover blob ownership must move to the tag cache");
+  assert.ok(!html.includes("function parseTagsDirectly("), "the uncached tag parser must be gone");
+});
+
+test("Tier-3 all-nodes-failed lock: the exhausted branch stops the watchdog and clears recovery state", () => {
+  const html = compactTemplate(renderHTML());
+  assert.ok(
+    html.includes("if (!song.availableNodes || nodeIndex >= song.availableNodes.length) { if (token !== playToken) return; stopStallHeartbeat(); stallRetries = 0; pendingSeek = null;"),
+    "the all-nodes-exhausted branch must stop the stall heartbeat and clear retries/pendingSeek before reporting"
+  );
+  assert.ok(
+    !html.includes("pendingSeek = null; stallRetries = 0;"),
+    "the reset pair must never appear without stopStallHeartbeat() preceding it — a reordered or stop-less cleanup must not exist"
+  );
+});
+
+test("Tier-3 progress-memory lock: key derives from currentSongRef, writes gated behind pendingSeek", () => {
+  const html = renderHTML();
+  assert.ok(html.includes("const rememberingKey = songKey(currentSongRef);"), "memory key must follow the actually-playing song");
+  assert.ok(!html.includes("const rememberingKey = songKey(currentPlaylist[currentIndex]);"), "memory key must never be derived from the mutable playlist slot");
+  assert.ok(html.includes("if (pendingSeek === null && isFinite(audio.currentTime)) {"), "memory writes must be skipped while a seek/load is pending");
+  assert.ok(!html.includes("const key = songKey(currentPlaylist[currentIndex]);"), "pagehide must use the same ref-derived key");
+  assert.ok(html.includes("const key = songKey(currentSongRef);"), "pagehide key must exist");
+});
+
+test("Tier-3 tag-cache trim lock: protected entries are skipped, never a hard return", () => {
+  const html = renderHTML();
+  assert.ok(html.includes("if (tagKey === keepKey || tagKey === shownKey) continue;"), "trim must skip protected keys and keep evicting");
+  assert.ok(!html.includes("if (oldest === keepKey || oldest === shownKey) return;"), "the old hard-return trim must be gone");
+  assert.ok(html.includes("trimTagCache(key, songKey(currentSongRef));"), "shown key must be ref-derived");
+});
+
+test("Tier-3 stale-play lock: an expired play rejection cannot set waitingForGesture", () => {
+  const html = compactTemplate(renderHTML());
+  assert.ok(html.includes("}).catch(err => { if (token !== playToken) return;"), "the play rejection handler must start with the token guard");
+});
+
+test("Tier-3 mirror-token lock: every node attempt allocates an independent token", () => {
+  const html = compactTemplate(renderHTML());
+  assert.ok(html.includes("async function tryPlayFromNode(song, nodeIndex, isAuto = false) { const token = ++playToken;"), "each mirror attempt must allocate a fresh token");
+  assert.ok(!html.includes("async function tryPlayFromNode(song, nodeIndex, isAuto = false) { const token = playToken;"), "a mirror attempt must not reuse the song-level token");
+});
+
+test("Tier-3 stall-recovery lock: only genuine forward progress resets the retry budget", () => {
+  const html = compactTemplate(renderHTML());
+  assert.ok(
+    html.includes("audio.ontimeupdate = () => { if (!audio.paused && pendingSeek === null && audio.readyState >= 3 && audio.currentTime > lastProgressTime) { lastProgressAt = Date.now(); stallRetries = 0; } lastProgressTime = audio.currentTime;"),
+    "ontimeupdate must clear the retry budget only on playing, seek-settled, demuxed, advancing frames"
+  );
+  assert.ok(
+    !html.includes("audio.ontimeupdate = () => { lastProgressTime = audio.currentTime; lastProgressAt = Date.now(); stallRetries = 0;"),
+    "the unconditional timeupdate reset must be gone — it erased the failover budget on seek/reload timeupdates"
+  );
+  assert.ok(
+    html.includes("if (audio.currentTime > lastProgressTime + 0.1) { lastProgressTime = audio.currentTime; lastProgressAt = Date.now(); return; }"),
+    "the heartbeat forward-progress observation must remain byte-identical"
+  );
+});
+
+test("Tier-3 lyrics-stale lock: a tag-cache miss clears lyrics before scheduling the parse", () => {
+  const html = compactTemplate(renderHTML());
+  assert.ok(
+    html.includes("} else { renderLrc(''); pendingTag = { song: song, url: streamUrl, token: playToken }; }"),
+    "the cache-miss branch must clear the previous song's lyrics before pendingTag is set"
+  );
+});
+
+test("Tier-3 tag-read lock: jsmediatags reads by URL (Range-savvy partial fetches) with cancellation preserved", () => {
+  const html = renderHTML();
+  assert.ok(html.includes("const tagUrl = new URL(url, window.location.href).href;"), "Contract C-2: the stream URL must be absolutized so the library's URL reader (HTTP Range windows: ID3v2 head / ID3v1 tail / MP4 moov / FLAC VORBISID3) dispatches with correct absolute offsets");
+  assert.ok(html.includes("jmt.read(tagUrl, {"), "Contract C-2: the library must receive the URL and fetch only the byte windows each format needs, never a materialized whole-file Blob");
+  assert.ok(!html.includes("await fetch(url"), "the whole-file fetch of the tag path must be gone");
+  assert.ok(!html.includes("res.blob()"), "the whole-file Blob materialization must be gone");
+  assert.ok(!html.includes("'Range': 'bytes=0-524288'"), "the fixed head-only 512 KB Range cap must stay gone (the library negotiates its own ranges)");
+  assert.ok(html.includes("tagAbort.signal.addEventListener('abort', cancelTagRead)"), "cancellation wiring: the abort signal must settle the read and best-effort abort the library reader (feature-detected)");
 });

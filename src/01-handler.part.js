@@ -1,3 +1,26 @@
+async function resolveSharedSongName(env, playId) {
+  if (!playId || !/^[0-9a-f]{8}$/i.test(playId)) return null;
+  const normPlayId = playId.toLowerCase();
+  try {
+    const cachedPlaylist = await env.MUSIC_KV.get("cache_v3_list_all", "json");
+    const cachedSong = cachedPlaylist && Array.isArray(cachedPlaylist.items) ? cachedPlaylist.items.find(item => item && item.id === normPlayId) : null;
+    if (cachedSong && typeof cachedSong.name === "string" && cachedSong.name) {
+      return cachedSong.name;
+    }
+    const sources = (await env.MUSIC_KV.get("dav_sources", { type: "json" })) || [];
+    for (const srcEntry of sources) {
+      const indexKey = srcEntry && typeof srcEntry.id === "string" ? shareIndexSourceKey(srcEntry.id) : null;
+      if (!indexKey) continue;
+      const pairs = await env.MUSIC_KV.get(indexKey, "json");
+      const found = pickShareIndexName(pairs, normPlayId);
+      if (found) return found;
+    }
+  } catch (e) {
+    console.error("resolveSharedSongName failed for", normPlayId, e);
+  }
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -36,6 +59,26 @@ export default {
           headers: { ...corsHeaders, "Content-Type": "application/javascript" }
         });
       }
+    }
+
+    if (url.pathname === "/og-icon.png" || url.pathname === "/favicon.ico") {
+      return new Response(decodeOgIconPng(), {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=604800"
+        }
+      });
+    }
+
+    if (url.pathname === "/icon.svg") {
+      return new Response(OG_ICON_SVG, {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "image/svg+xml; charset=utf-8",
+          "Cache-Control": "public, max-age=604800"
+        }
+      });
     }
 
     const getCookieToken = () => {
@@ -137,17 +180,30 @@ export default {
       const { sources, siteTitle, newAdminPass } = await request.json();
       if (newAdminPass && (typeof newAdminPass !== "string" || newAdminPass.length < 8)) return new Response(JSON.stringify({ error: "新密码长度至少 8 位" }), { status: 400, headers: corsHeaders });
       if (sources && !Array.isArray(sources)) return new Response(JSON.stringify({ error: "源配置格式无效" }), { status: 400, headers: corsHeaders });
-      if (sources) {
-        if (sources.some(s => !s || typeof s !== "object" || !isValidSourceUrl(s.url))) {
-          return new Response(JSON.stringify({ error: "源配置无效：url 必须为 http/https 且格式合法" }), { status: 400, headers: corsHeaders });
-        }
-        await env.MUSIC_KV.put("dav_sources", JSON.stringify(sources));
+      if (sources && sources.some(s => !s || typeof s !== "object" || !isValidSourceUrl(s.url))) {
+        return new Response(JSON.stringify({ error: "源配置无效：url 必须为 http/https 且格式合法" }), { status: 400, headers: corsHeaders });
       }
+
       if (siteTitle) await env.MUSIC_KV.put("site_title", siteTitle);
 
       const listKeys = await env.MUSIC_KV.list({ prefix: "cache_v3_list_" });
       for (const k of listKeys.keys) {
         await env.MUSIC_KV.delete(k.name);
+      }
+
+      if (sources) {
+        const oldSources = (await env.MUSIC_KV.get("dav_sources", { type: "json" })) || [];
+        await env.MUSIC_KV.put("dav_sources", JSON.stringify(sources));
+        const keptIds = new Set(sources.map(s => s && typeof s.id === "string" ? s.id : null));
+        for (const oldSrc of oldSources) {
+          const oldId = oldSrc && typeof oldSrc.id === "string" ? oldSrc.id : null;
+          if (oldId === null) continue;
+          const oldKey = shareIndexSourceKey(oldId);
+          if (oldKey === null || keptIds.has(oldId)) continue;
+          try {
+            await env.MUSIC_KV.delete(oldKey);
+          } catch (e) {}
+        }
       }
 
       const headers = new Headers(corsHeaders);
@@ -288,6 +344,22 @@ export default {
 
         if (finalItems.length > 0) {
           await env.MUSIC_KV.put(cacheKey, JSON.stringify(responsePayload), { expirationTtl: 1800 });
+          try {
+            const bySource = {};
+            for (const item of finalItems) {
+              const nodes = item && Array.isArray(item.availableNodes) ? item.availableNodes : [];
+              for (const node of nodes) {
+                if (!node || typeof node.sourceId !== "string") continue;
+                if (!bySource[node.sourceId]) bySource[node.sourceId] = [];
+                bySource[node.sourceId].push(item);
+              }
+            }
+            for (const sourceId of Object.keys(bySource)) {
+              const indexKey = shareIndexSourceKey(sourceId);
+              if (!indexKey) continue;
+              await env.MUSIC_KV.put(indexKey, JSON.stringify(normalizeShareIndexPairs(bySource[sourceId])));
+            }
+          } catch (e) {}
         }
 
         const out = { ...responsePayload };
@@ -350,8 +422,10 @@ export default {
         forwardHeaders.set("Authorization", "Basic " + btoa(unescape(encodeURIComponent(`${src.user || ""}:${src.pass || ""}`))));
       }
 
-      if (request.headers.has("Range")) {
+      const clientRange = parseSingleByteRange(request.headers.get("Range"));
+      if (clientRange) {
         forwardHeaders.set("Range", request.headers.get("Range"));
+        forwardHeaders.set("Accept-Encoding", "identity");
       }
 
       try {
@@ -359,6 +433,27 @@ export default {
           method: request.method,
           headers: forwardHeaders
         });
+
+        if (res.status === 416) {
+          const rangeRejectHeaders = new Headers(res.headers);
+          rangeRejectHeaders.set("Access-Control-Allow-Origin", "*");
+          rangeRejectHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
+          rangeRejectHeaders.set("Access-Control-Allow-Headers", "*");
+          rangeRejectHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+          if (!rangeRejectHeaders.get("Content-Range")) {
+            const rejectLength = res.headers.get("Content-Length");
+            if (rejectLength && /^\d+$/.test(rejectLength)) {
+              rangeRejectHeaders.set("Content-Range", "bytes */" + rejectLength);
+            }
+          }
+          rangeRejectHeaders.delete("Content-Length");
+          rangeRejectHeaders.delete("Accept-Ranges");
+          return new Response(null, {
+            status: 416,
+            statusText: res.statusText || "Range Not Satisfiable",
+            headers: rangeRejectHeaders
+          });
+        }
 
         if (!res.ok && res.status !== 206) {
           const bodyText = await res.text().catch(() => "");
@@ -380,7 +475,42 @@ export default {
         respHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
         respHeaders.set("Access-Control-Allow-Headers", "*");
         respHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
-        respHeaders.set("Accept-Ranges", "bytes");
+        if (!respHeaders.get("Content-Type")) {
+          const fallbackType = audioContentTypeFor(rawFile);
+          if (fallbackType) respHeaders.set("Content-Type", fallbackType);
+        }
+
+        const upstreamLengthRaw = res.headers.get("Content-Length");
+        const upstreamTotal = upstreamLengthRaw && /^\d+$/.test(upstreamLengthRaw) ? parseInt(upstreamLengthRaw, 10) : null;
+
+        if (clientRange && res.status === 200 && upstreamTotal !== null && !res.headers.get("Content-Encoding")) {
+          const clientStart = clientRange.suffix !== null ? Math.max(0, upstreamTotal - clientRange.suffix) : clientRange.start;
+          if (clientStart >= upstreamTotal) {
+            respHeaders.set("Content-Range", "bytes */" + upstreamTotal);
+            respHeaders.delete("Content-Length");
+            respHeaders.delete("Accept-Ranges");
+            return new Response(null, { status: 416, statusText: "Range Not Satisfiable", headers: respHeaders });
+          }
+          const rangeEnd = clientRange.end !== null ? Math.min(clientRange.end, upstreamTotal - 1) : upstreamTotal - 1;
+          const rangeCount = rangeEnd - clientStart + 1;
+          const sliced = sliceReadableStream(res.body, clientStart, rangeCount);
+          if (sliced) {
+            respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+            respHeaders.set("Content-Length", String(rangeCount));
+            respHeaders.set("Accept-Ranges", "bytes");
+            return new Response(sliced, { status: 206, statusText: "Partial Content", headers: respHeaders });
+          }
+          respHeaders.delete("Accept-Ranges");
+          return new Response(res.body, { status: res.status, statusText: res.statusText, headers: respHeaders });
+        }
+
+        if (res.status === 206) {
+          respHeaders.set("Accept-Ranges", "bytes");
+        }
+
+        if (clientRange && res.status === 200 && res.headers.get("Content-Encoding")) {
+          respHeaders.delete("Accept-Ranges");
+        }
 
         return new Response(res.body, {
           status: res.status,
@@ -407,18 +537,19 @@ export default {
     pageHeaders.set("Cache-Control", "no-store");
 
     const playId = url.searchParams.get("play") || url.searchParams.get("v") || url.searchParams.get("id");
+    let siteTitle = "";
+    try {
+      siteTitle = (await env.MUSIC_KV.get("site_title")) || "";
+    } catch (e) {
+      siteTitle = "";
+    }
+    const sharedSongName = await resolveSharedSongName(env, playId);
     let html = renderHTML();
-    if (playId && /^[0-9a-f]{8}$/i.test(playId)) {
-      try {
-        const normPlayId = playId.toLowerCase();
-        const siteTitle = (await env.MUSIC_KV.get("site_title")) || "";
-        const cachedPlaylist = await env.MUSIC_KV.get("cache_v3_list_all", "json");
-        const sharedSong = cachedPlaylist && Array.isArray(cachedPlaylist.items) ? cachedPlaylist.items.find(item => item && item.id === normPlayId) : null;
-        if (sharedSong) {
-          const metaHtml = buildShareHeadHtml(url.href, sharedSong.name, siteTitle);
-          html = html.replace("<title>Cloud Music Hub</title>", () => metaHtml);
-        }
-      } catch (e) {}
+    const coverId = playId && /^[0-9a-f]{8}$/i.test(playId) ? playId.toLowerCase() : null;
+    html = html.replace("<!--SHARE_HEAD-->", () => buildShareHeadHtml(url.href, sharedSongName, siteTitle, coverId));
+    if (sharedSongName) {
+      const sharedTitle = escapeHtmlText(shareTitleText(sharedSongName, siteTitle || "Cloud Music Hub"));
+      html = html.replace("<title>Cloud Music Hub</title>", () => "<title>" + sharedTitle + "</title>");
     }
     return new Response(html, { headers: pageHeaders });
   }

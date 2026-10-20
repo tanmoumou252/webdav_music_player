@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createKV } from "./kv.mjs";
 import * as F from "./fixtures.mjs";
 import {
@@ -658,7 +659,249 @@ export function scenarios() {
       stub: null,
       post: async () => ({}),
     },
+    {
+      name: "stream-range-upstream-ignores-tail",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=100-" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-range-upstream-ignores-window",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=10-19" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-suffix-upstream-ignores-tail",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=-300" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-suffix-oversize-full",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=-900" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-suffix-upstream-honest-206",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=-300" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response("xyz", { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": "bytes 497-499/500", "content-length": "3" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-suffix-empty-416",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=-300" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response("", { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "0" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-range-unsatisfiable",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=900-" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-range-upstream-no-length",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=100-" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-norange-upstream-advertises-ranges",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"),
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500", "accept-ranges": "bytes" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-content-type-fallback",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"),
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(new Uint8Array(Buffer.from(F.RANGE_BODY_500, "latin1")), { status: 200, statusText: "OK", headers: { "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "stream-upstream-416-passthrough",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=900-" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(null, { status: 416, statusText: "Range Not Satisfiable", headers: { "content-range": "bytes */500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "list-all-writes-share-index",
+      seedKV: seedSources([F.SOURCE_A, F.SOURCE_B], true),
+      request: GET("/api/list", COOKIE),
+      stub: route({
+        [F.SOURCE_A.url]: F.davResponse(F.PROPFIND_A),
+        [F.SOURCE_B.url]: F.davResponse(F.PROPFIND_B),
+      }),
+      post: async (env) => ({
+        indexA: JSON.parse((await env.MUSIC_KV.get("share_meta_index_v1_a")) || "null"),
+        indexB: JSON.parse((await env.MUSIC_KV.get("share_meta_index_v1_b")) || "null"),
+      }),
+    },
+    {
+      name: "list-single-writes-share-index",
+      seedKV: seedSources([F.SOURCE_A], true),
+      request: GET("/api/list?sourceId=a", COOKIE),
+      stub: route({ [F.SOURCE_A.url]: F.davResponse(F.PROPFIND_A) }),
+      post: async (env) => ({ indexA: JSON.parse((await env.MUSIC_KV.get("share_meta_index_v1_a")) || "null") }),
+    },
+    {
+      name: "list-source-index-isolation",
+      seedKV: {
+        ...seedSources([F.SOURCE_A, F.SOURCE_B], true),
+        share_meta_index_v1_b: JSON.stringify([["beefbeef", "Untouched - ByB.mp3"]]),
+      },
+      request: GET("/api/list?sourceId=a", COOKIE),
+      stub: route({ [F.SOURCE_A.url]: F.davResponse(F.PROPFIND_A) }),
+      post: async (env) => ({
+        indexA: JSON.parse((await env.MUSIC_KV.get("share_meta_index_v1_a")) || "null"),
+        indexB: JSON.parse((await env.MUSIC_KV.get("share_meta_index_v1_b")) || "null"),
+      }),
+    },
+    {
+      name: "play-hit-index-fallback",
+      seedKV: {
+        site_title: "分享站",
+        dav_sources: JSON.stringify([F.SOURCE_A]),
+        share_meta_index_v1_a: JSON.stringify([["a1b2c3d4", "Artist - Title.mp3"]]),
+      },
+      request: GET("/?play=a1b2c3d4"),
+      stub: null,
+      post: async () => ({}),
+    },
+    {
+      name: "play-miss-no-index",
+      seedKV: {
+        site_title: "分享站",
+        cache_v3_list_all: JSON.stringify({ items: [], debugs: [], diagnostics: null, fromCache: false, isAdmin: false }),
+        share_meta_index_v1_b: JSON.stringify([["22222222", "Other - Song.mp3"]]),
+      },
+      request: GET("/?play=deadbeef"),
+      stub: null,
+      post: async () => ({}),
+    },
+    {
+      name: "play-hit-xss",
+      seedKV: {
+        site_title: "分享站",
+        dav_sources: JSON.stringify([F.SOURCE_A]),
+        share_meta_index_v1_a: JSON.stringify([["deadbeef", "<script>alert(1)</script> - \"Quote\" & Amp.mp3"]]),
+      },
+      request: GET("/?play=deadbeef"),
+      stub: null,
+      post: async () => ({}),
+    },
+    {
+      name: "play-hit-orphan-index",
+      seedKV: {
+        site_title: "分享站",
+        dav_sources: JSON.stringify([F.SOURCE_A]),
+        share_meta_index_v1_b: JSON.stringify([["22222222", "Ghost - Song.mp3"]]),
+      },
+      request: GET("/?play=22222222"),
+      stub: null,
+      post: async () => ({}),
+    },
+    {
+      name: "sources-post-removes-index",
+      seedKV: seedAdmin({
+        dav_sources: JSON.stringify([F.SOURCE_A, F.SOURCE_B]),
+        share_meta_index_v1_a: JSON.stringify([["aaaaaaaa", "Keep - Me.mp3"]]),
+        share_meta_index_v1_b: JSON.stringify([["bbbbbbbb", "Drop - Me.mp3"]]),
+      }),
+      request: POST("/api/admin/sources", { sources: [F.SOURCE_A] }, COOKIE),
+      stub: null,
+      post: async (env) => ({
+        indexA: (await env.MUSIC_KV.get("share_meta_index_v1_a")) !== null,
+        indexB: (await env.MUSIC_KV.get("share_meta_index_v1_b")) !== null,
+        sourcesLen: JSON.parse(await env.MUSIC_KV.get("dav_sources")).length,
+      }),
+    },
+    {
+      name: "sources-post-key-collision",
+      seedKV: seedAdmin({
+        dav_sources: JSON.stringify([{ id: "a.b", name: "旧源", url: "https://dav.example.com/dav/" }]),
+        share_meta_index_v1_ab: JSON.stringify([["aaaaaaaa", "Keep - Collide.mp3"]]),
+      }),
+      request: POST("/api/admin/sources", { sources: [{ id: "ab", name: "新源", url: "https://dav.example.com/dav/" }] }, COOKIE),
+      stub: null,
+      post: async (env) => ({
+        oldIndexPresent: (await env.MUSIC_KV.get("share_meta_index_v1_ab")) !== null,
+        sourcesLen: JSON.parse(await env.MUSIC_KV.get("dav_sources")).length,
+      }),
+    },
+    {
+      name: "og-icon-png",
+      seedKV: {},
+      request: GET("/og-icon.png"),
+      stub: null,
+      post: async () => ({}),
+    },
+    {
+      name: "og-icon-svg",
+      seedKV: {},
+      request: GET("/icon.svg"),
+      stub: null,
+      post: async () => ({}),
+    },
+    {
+      name: "favicon-ico",
+      seedKV: {},
+      request: GET("/favicon.ico"),
+      stub: null,
+      post: async () => ({}),
+    },
   ];
+}
+
+export function scenarioNamed(name) {
+  const found = scenarios().find((s) => s.name === name);
+  if (!found) throw new Error("scenario not found: " + name);
+  return found;
 }
 
 export async function runOne(scenario, worker) {
@@ -679,12 +922,18 @@ export async function runOne(scenario, worker) {
         const cookies = res.headers.getSetCookie();
         if (cookies.length) headers["set-cookie[]"] = cookies;
       }
+      const raw = await res.arrayBuffer();
+      const contentType = String(headers["content-type"] || "");
+      const isTextBody = contentType === "" || /^(text\/|application\/json|application\/javascript|image\/svg\+xml)/.test(contentType);
+      const body = isTextBody
+        ? new TextDecoder().decode(raw)
+        : { binLen: raw.byteLength, sha256: createHash("sha256").update(Buffer.from(raw)).digest("hex") };
       return {
         name: scenario.name,
         status: res.status,
         statusText: res.statusText,
         headers,
-        body: await res.text(),
+        body,
         stubCalls: stubs.calls,
         post: await scenario.post(env),
       };
@@ -697,11 +946,23 @@ export async function runOne(scenario, worker) {
 }
 
 export function contains(rec, needle) {
+  if (typeof rec.body !== "string") {
+    throw new TypeError("contains(): expected a string body for scenario '" + rec.name + "' but got a " + describeBody(rec.body) + " — text-substring checks do not apply to summarized bodies");
+  }
   return rec.body.includes(needle);
 }
 
 export function bodyJson(rec) {
+  if (typeof rec.body !== "string") {
+    throw new TypeError("bodyJson(): expected a string body for scenario '" + rec.name + "' but got a " + describeBody(rec.body) + " — JSON parsing does not apply to summarized bodies");
+  }
   return jsonText(rec.body);
+}
+
+function describeBody(body) {
+  if (body && typeof body === "object" && "htmlLen" in body) return "html digest {htmlLen, sha256}";
+  if (body && typeof body === "object" && "binLen" in body) return "binary digest {binLen, sha256}";
+  return body === undefined ? "undefined body" : typeof body;
 }
 
 export function goldensOf(results) {

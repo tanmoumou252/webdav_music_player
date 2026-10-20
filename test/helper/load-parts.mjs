@@ -55,6 +55,13 @@ const HANDLES = [
   "getShareDisplayParts",
   "escapeHtmlText",
   "buildShareHeadHtml",
+  "shareTitleText",
+  "decodeOgIconPng",
+  "OG_ICON_PNG_B64",
+  "OG_ICON_SVG",
+  "normalizeShareIndexPairs",
+  "shareIndexSourceKey",
+  "pickShareIndexName",
   "generateTrackId",
   "decodeXmlEntities",
   "normalizeSongKey",
@@ -69,6 +76,9 @@ const HANDLES = [
   "streamPathReject",
   "resolveWebDavUrl",
   "fetchWebDavList",
+  "parseSingleByteRange",
+  "audioContentTypeFor",
+  "sliceReadableStream",
   "renderHTML",
 ];
 

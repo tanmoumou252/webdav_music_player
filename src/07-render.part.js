@@ -5,6 +5,7 @@ function renderHTML() {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Cloud Music Hub</title>
+  <!--SHARE_HEAD-->
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%231ed760'%3E%3Cpath d='M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6z'/%3E%3C/svg%3E">
 
   <style>
@@ -363,9 +364,9 @@ function renderHTML() {
 
     @media (max-width: 768px) {
       body { flex-direction: column; height: 100vh; height: 100dvh; }
-      .stage { grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 14px; padding: 64px 14px calc(var(--bar-height, 86px) + 16px + env(safe-area-inset-bottom, 0px)); }
-      .cover-box { width: min(72vw, 300px); }
-      .lyrics-view { height: min(38vh, 300px); }
+      .stage { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 12px; padding: 56px 14px calc(var(--bar-height, 86px) + 12px + env(safe-area-inset-bottom, 0px)); overflow: hidden; }
+      .cover-box { width: auto; height: min(72vw, 300px, 42dvh); aspect-ratio: 1; }
+      .lyrics-view { flex: 1 1 auto; min-height: 88px; height: auto; }
       #bar { grid-template-columns: 36px minmax(0, 1fr) 36px; gap: 12px; padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); }
       .ctrl-group { min-width: 0; }
       .ctrl-buttons { gap: 12px; flex-wrap: nowrap; }
@@ -376,6 +377,12 @@ function renderHTML() {
       #error-banner { top: 12px; max-width: calc(100vw - 48px); font-size: 0.78rem; padding: 6px 10px; }
       #stage-actions { top: 12px; right: 12px; }
       body.drawer-lock .stage, body.drawer-lock .lrc-box { touch-action: none; }
+    }
+
+    @media (max-height: 560px) {
+      .stage { display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 10px; padding: 56px 12px calc(var(--bar-height, 86px) + 10px + env(safe-area-inset-bottom, 0px)); overflow: hidden; }
+      .cover-box { width: auto; height: min(48dvh, 40vw, 240px); aspect-ratio: 1; }
+      .lyrics-view { flex: 1 1 auto; min-height: 72px; height: auto; }
     }
 
     @media (max-width: 360px) {
@@ -558,7 +565,7 @@ function renderHTML() {
       </button>
     </div>
   </div>
-  <audio id="audio"></audio>
+  <audio id="audio" preload="metadata"></audio>
 
   <div class="modal" id="init-modal">
     <div class="modal-box">
@@ -772,6 +779,7 @@ function renderHTML() {
     let playMode = 'repeat';
     let lrcData = [];
     let isAuthed = false;
+    let siteTitle = '';
     let latestDiagnostic = null;
     let lastDiagKey = '';
     let lastDiagTs = 0;
@@ -780,6 +788,29 @@ function renderHTML() {
     let isUserScrollingLyrics = false;
     let userScrollTimer = null;
     let jmtLoader = null;
+    let tagCache = new Map();
+    let tagAbort = null;
+    let pendingTag = null;
+    let progressMemory = new Map();
+    let pendingSeek = null;
+    let pendingShareSeek = null;
+    let stallHeartbeat = null;
+    let lastProgressAt = 0;
+    let lastProgressTime = 0;
+    let stallRetries = 0;
+    let userPaused = false;
+    let waitingForGesture = false;
+    let externallyPaused = false;
+    let currentSongRef = null;
+    let currentNodeIndex = 0;
+    let currentIsAuto = false;
+    let lastPersistAt = 0;
+    const STALL_TIMEOUT_MS = 15000;
+    const STALL_HEARTBEAT_MS = 5000;
+    const STALL_MAX_RETRIES = 2;
+    const TAG_CACHE_MAX = 24;
+    const PROGRESS_STORE_KEY = 'webdav_player_progress_v1';
+    const PROGRESS_TTL_MS = 21600000;
 
     function escapeHtml(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -891,6 +922,24 @@ function renderHTML() {
       const m = Math.floor(sec / 60);
       const s = Math.floor(sec % 60);
       return (m < 10 ? "0" + m : m) + ":" + (s < 10 ? "0" + s : s);
+    }
+
+    function parseShareTime(raw) {
+      if (typeof raw !== "string") return null;
+      const m = raw.match(/^((?:\\d{1,2})h)?((?:\\d{1,3})m)?((?:\\d{1,2})s)?$/);
+      if (!m || (!m[1] && !m[2] && !m[3])) return null;
+      const sec = (m[1] ? parseInt(m[1], 10) * 3600 : 0) + (m[2] ? parseInt(m[2], 10) * 60 : 0) + (m[3] ? parseInt(m[3], 10) : 0);
+      if (!isFinite(sec) || sec < 3 || sec >= 86400) return null;
+      return sec;
+    }
+
+    function formatShareTime(sec) {
+      if (!isFinite(sec) || sec < 3) return "";
+      let rest = Math.floor(sec);
+      const h = Math.floor(rest / 3600); rest -= h * 3600;
+      const m = Math.floor(rest / 60); rest -= m * 60;
+      const s = rest;
+      return (h ? h + "h" : "") + (m ? m + "m" : "") + (s ? s + "s" : "");
     }
 
     function showToast(msg) {
@@ -1007,10 +1056,11 @@ function renderHTML() {
         return showToast('请先选择一首歌播放');
       }
       const song = currentPlaylist[currentIndex];
-      const shareUrl = window.location.origin + window.location.pathname + '?play=' + song.id;
+      const stamp = formatShareTime(audio.currentTime);
+      const shareUrl = window.location.origin + window.location.pathname + '?play=' + song.id + (stamp ? '&t=' + stamp : "");
       if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(shareUrl).then(() => {
-          showToast('已复制 8 位精简直达分享链接！');
+          showToast(stamp ? '已复制链接（从 ' + formatTime(audio.currentTime) + ' 开始播放）' : '已复制 8 位精简直达分享链接！');
         }).catch(() => fallbackCopyText(shareUrl));
       } else {
         fallbackCopyText(shareUrl);
@@ -1179,7 +1229,9 @@ function renderHTML() {
       getJsMediaTags().catch(() => {});
       const res = await fetch('/api/status');
       const data = await res.json();
-      if (data.title) document.getElementById('title-text').textContent = data.title;
+      const statusParams = new URLSearchParams(window.location.search);
+      const isSharePage = !!(statusParams.get('play') || statusParams.get('v') || statusParams.get('id'));
+      if (data.title) { siteTitle = data.title; document.getElementById('title-text').textContent = data.title; if (!isSharePage) document.title = data.title; }
       isAuthed = data.isAdmin;
 
       const refreshBtn = document.getElementById('refresh-btn');
@@ -1199,6 +1251,7 @@ function renderHTML() {
       const urlParams = new URLSearchParams(window.location.search);
       const targetPlayId = urlParams.get('play') || urlParams.get('v') || urlParams.get('id');
       const legacySongName = urlParams.get('song');
+      if (targetPlayId || legacySongName) pendingShareSeek = parseShareTime(urlParams.get('t'));
 
       await loadPlaylist(false, targetPlayId, legacySongName);
     }
@@ -1277,7 +1330,7 @@ function renderHTML() {
       syncPlaylistCurrentLocate();
 
       if (matchedIndex !== -1) {
-        playTrackByIndex(matchedIndex, true);
+        playTrackByIndex(matchedIndex, true, true);
       }
     }
 
@@ -1308,23 +1361,49 @@ function renderHTML() {
       syncPlaylistCurrentLocate();
     }
 
-    function playTrackByIndex(idx, isAuto = false) {
+    function playTrackByIndex(idx, isAuto = false, resume = false) {
       if (idx < 0 || idx >= currentPlaylist.length) return;
       clearError();
       currentIndex = idx;
       updateSidebarActive(idx);
       const song = currentPlaylist[idx];
-      startPlayback(song, 0, true, isAuto);
+      startPlayback(song, 0, true, isAuto, resume);
     }
 
-    function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false) {
+    function startPlayback(song, nodeIndex = 0, syncUrl = true, isAuto = false, resume = false) {
       playToken = playToken + 1;
       resetCoverAmbient();
+      if (tagAbort) tagAbort.abort();
+      tagAbort = new AbortController();
+      pendingTag = null;
+      startStallHeartbeat();
+      stallRetries = 0;
+      userPaused = false;
+      waitingForGesture = false;
+      externallyPaused = false;
+      currentSongRef = song;
       document.getElementById('stitle').textContent = song.name.replace(/\.[^/.]+$/, "");
       document.getElementById('sartist').textContent = "正在解析内嵌标签...";
-      const prevCover = document.getElementById('cover').src;
-      if (prevCover && prevCover.indexOf('blob:') === 0) URL.revokeObjectURL(prevCover);
+      const fallbackTitle = song.name.replace(/\.[^/.]+$/, "");
+      document.title = fallbackTitle + " | " + (siteTitle || "Cloud Music Hub");
+      if (navigator.mediaSession && window.MediaMetadata) {
+        try {
+          navigator.mediaSession.metadata = new window.MediaMetadata({ title: fallbackTitle, artist: '', artwork: [] });
+        } catch (e) {}
+      }
       document.getElementById('cover').src = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='100' height='100' fill='%231f1f1f'><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='%237c7c7c' font-size='12'>读取中</text></svg>";
+      if (resume) {
+        if (pendingShareSeek !== null) {
+          pendingSeek = pendingShareSeek;
+          pendingShareSeek = null;
+        } else {
+          pendingSeek = lastKnownProgress(song);
+        }
+      } else {
+        pendingShareSeek = null;
+        forgetProgress(song);
+        pendingSeek = null;
+      }
 
       resumeAutoScroll();
 
@@ -1338,10 +1417,13 @@ function renderHTML() {
     }
 
     async function tryPlayFromNode(song, nodeIndex, isAuto = false) {
-      const token = playToken;
+      const token = ++playToken;
 
       if (!song.availableNodes || nodeIndex >= song.availableNodes.length) {
         if (token !== playToken) return;
+        stopStallHeartbeat();
+        stallRetries = 0;
+        pendingSeek = null;
         reportDiagnostic({
           title: "所有 WebDAV 线路均尝试失败",
           sourceName: "全局容灾",
@@ -1360,13 +1442,23 @@ function renderHTML() {
 
       const streamUrl = '/api/stream?sourceId=' + encodeURIComponent(node.sourceId) + '&file=' + encodeURIComponent(node.href);
 
+      currentNodeIndex = nodeIndex;
+      currentIsAuto = isAuto;
+      if (pendingSeek === null) pendingSeek = lastKnownProgress(song);
+
       audio.src = streamUrl;
+      resetStallMarks();
       const playPromise = audio.play();
       if (playPromise !== undefined) {
         playPromise.then(() => {
           if (token !== playToken) return;
+          waitingForGesture = false;
           document.getElementById('play-icon').setAttribute('href', '#icon-pause');
-        }).catch(err => console.warn("等待缓冲或交互触发:", err));
+        }).catch(err => {
+          if (token !== playToken) return;
+          waitingForGesture = true;
+          console.warn("等待缓冲或交互触发:", err);
+        });
       }
 
       audio.onerror = async () => {
@@ -1383,21 +1475,42 @@ function renderHTML() {
         }
         if (token !== playToken) return;
         console.warn('节点 ' + (nodeIndex + 1) + ' 失败，尝试下一镜像...');
+        pendingSeek = lastKnownProgress(song) || pendingSeek;
         tryPlayFromNode(song, nodeIndex + 1, isAuto);
       };
 
-      parseTagsDirectly(streamUrl, song.name);
+      const cachedTags = tagCache.get(songKey(song));
+      if (cachedTags) {
+        renderTags(cachedTags, song.name);
+      } else {
+        renderLrc('');
+        pendingTag = { song: song, url: streamUrl, token: playToken };
+      }
     }
 
     function togglePlay() {
       if (audio.paused) {
         if (currentIndex === -1 && currentPlaylist.length > 0) {
           playTrackByIndex(0);
-        } else {
-          audio.play();
-          document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+          return;
         }
+        userPaused = false;
+        waitingForGesture = false;
+        externallyPaused = false;
+        startStallHeartbeat();
+        if (currentSongRef && (audio.error !== null || (audio.readyState === 0 && audio.currentTime === 0))) {
+          const restored = lastKnownProgress(currentSongRef);
+          if (restored !== null) {
+            pendingSeek = restored;
+            tryPlayFromNode(currentSongRef, currentNodeIndex, currentIsAuto);
+            return;
+          }
+        }
+        audio.play();
+        document.getElementById('play-icon').setAttribute('href', '#icon-pause');
       } else {
+        userPaused = true;
+        stopStallHeartbeat();
         audio.pause();
         document.getElementById('play-icon').setAttribute('href', '#icon-play');
       }
@@ -1463,6 +1576,16 @@ function renderHTML() {
     }
 
     audio.ontimeupdate = () => {
+      if (!audio.paused && pendingSeek === null && audio.readyState >= 3 && audio.currentTime > lastProgressTime) {
+        lastProgressAt = Date.now();
+        stallRetries = 0;
+      }
+      lastProgressTime = audio.currentTime;
+      const rememberingKey = songKey(currentSongRef);
+      if (pendingSeek === null && isFinite(audio.currentTime)) {
+        if (rememberingKey !== null) progressMemory.set(rememberingKey, audio.currentTime);
+        persistProgress(rememberingKey, audio.currentTime);
+      }
       document.getElementById('time-current').textContent = formatTime(audio.currentTime);
       if (audio.duration) {
         const pct = (audio.currentTime / audio.duration) * 100;
@@ -1497,6 +1620,17 @@ function renderHTML() {
 
     audio.onloadedmetadata = () => {
       document.getElementById('time-duration').textContent = formatTime(audio.duration);
+      if (pendingSeek !== null && isFinite(audio.duration) && pendingSeek > 3 && pendingSeek < audio.duration - 10) {
+        try { audio.currentTime = pendingSeek; } catch (e) {}
+      }
+      pendingSeek = null;
+      resetStallMarks();
+      startStallHeartbeat();
+      if (pendingTag && pendingTag.token === playToken) {
+        const job = pendingTag;
+        pendingTag = null;
+        parseAndCacheTags(job.song, job.url, job.token);
+      }
     };
 
     function resetCoverAmbient() {
@@ -1554,52 +1688,237 @@ function renderHTML() {
       }
     }
 
-    async function parseTagsDirectly(url, fallbackTitle) {
+    function songKey(song) {
+      if (!song) return null;
+      return song.id || song.name || null;
+    }
+
+    function lastKnownProgress(song) {
+      const key = songKey(song);
+      if (key === null) return null;
+      if (progressMemory.has(key)) return progressMemory.get(key);
       try {
-        const jmt = await getJsMediaTags();
-        if (!jmt) {
-          document.getElementById('sartist').textContent = "未知艺术家";
-          renderLrc('');
-          return;
-        }
-
-        const res = await fetch(url, { headers: { 'Range': 'bytes=0-524288' } });
-        if (!res.ok && res.status !== 206) throw new Error();
-        const blob = await res.blob();
-
-        jmt.read(blob, {
-          onSuccess: (tag) => {
-            const t = tag.tags;
-            document.getElementById('stitle').textContent = t.title || fallbackTitle;
-            document.getElementById('sartist').textContent = t.artist || "未知艺术家";
-
-            const cover = document.getElementById('cover');
-            if (t.picture && cover) {
-              const byteArr = new Uint8Array(t.picture.data);
-              const imgBlob = new Blob([byteArr], { type: t.picture.format });
-              const objUrl = URL.createObjectURL(imgBlob);
-              cover.onload = () => { if (cover.src !== objUrl) return; applyCoverAmbient(cover); };
-              cover.onerror = () => { if (cover.src === objUrl) resetCoverAmbient(); };
-              cover.src = objUrl;
-            } else {
-              resetCoverAmbient();
-            }
-
-            let lrc = "";
-            if (t.lyrics) lrc = typeof t.lyrics === 'string' ? t.lyrics : (t.lyrics.lyrics || t.lyrics.data?.lyrics || "");
-            else if (t.USLT) lrc = t.USLT.data?.lyrics || t.USLT.data || "";
-            renderLrc(lrc);
-          },
-          onError: () => {
-            document.getElementById('sartist').textContent = "未知艺术家";
-            renderLrc('');
-          }
-        });
-      } catch (err) {
-        document.getElementById('sartist').textContent = "未知艺术家";
-        renderLrc('');
+        const raw = sessionStorage.getItem(PROGRESS_STORE_KEY);
+        if (!raw) return null;
+        const rec = JSON.parse(raw);
+        if (!rec || rec.key !== key || typeof rec.time !== 'number') return null;
+        if (Date.now() - rec.at > PROGRESS_TTL_MS) return null;
+        if (rec.time < 3) return null;
+        progressMemory.set(key, rec.time);
+        return rec.time;
+      } catch (e) {
+        return null;
       }
     }
+
+    function persistProgress(key, time) {
+      if (key === null || !isFinite(time) || time < 3) return;
+      const now = Date.now();
+      if (now - lastPersistAt < 5000) return;
+      lastPersistAt = now;
+      try {
+        sessionStorage.setItem(PROGRESS_STORE_KEY, JSON.stringify({ key: key, time: time, at: now }));
+      } catch (e) {}
+    }
+
+    function forgetProgress(song) {
+      const key = songKey(song);
+      if (key === null) return;
+      progressMemory.delete(key);
+      try {
+        const raw = sessionStorage.getItem(PROGRESS_STORE_KEY);
+        if (raw) {
+          const rec = JSON.parse(raw);
+          if (rec && rec.key === key) sessionStorage.removeItem(PROGRESS_STORE_KEY);
+        }
+      } catch (e) {}
+    }
+
+    function resetStallMarks() {
+      lastProgressTime = audio.currentTime;
+      lastProgressAt = Date.now();
+    }
+
+    function startStallHeartbeat() {
+      stopStallHeartbeat();
+      resetStallMarks();
+      stallHeartbeat = window.setInterval(stallHeartbeatTick, STALL_HEARTBEAT_MS);
+    }
+
+    function stopStallHeartbeat() {
+      if (stallHeartbeat !== null) {
+        window.clearInterval(stallHeartbeat);
+        stallHeartbeat = null;
+      }
+    }
+
+    function stallHeartbeatTick() {
+      if (!currentSongRef || userPaused || waitingForGesture || externallyPaused) return;
+      if (audio.currentTime > lastProgressTime + 0.1) {
+        lastProgressTime = audio.currentTime;
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (audio.readyState >= 3) {
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (Date.now() - lastProgressAt < STALL_TIMEOUT_MS) return;
+      recoverPlayback();
+    }
+
+    function recoverPlayback() {
+      const song = currentSongRef;
+      if (!song) return;
+      if (stallRetries < STALL_MAX_RETRIES) {
+        stallRetries = stallRetries + 1;
+        console.warn('播放停滞，就地重连并回到上次进度（第 ' + stallRetries + ' 次）');
+        showToast('网络抖动，正在恢复播放位置…');
+        pendingSeek = lastKnownProgress(song);
+        resetStallMarks();
+        tryPlayFromNode(song, currentNodeIndex, currentIsAuto);
+        return;
+      }
+      stallRetries = 0;
+      console.warn('就地重连无效，切换下一镜像线路');
+      resetStallMarks();
+      tryPlayFromNode(song, currentNodeIndex + 1, currentIsAuto);
+    }
+
+    function normalizeTags(t) {
+      const out = { title: null, artist: null, coverUrl: null, lrc: '' };
+      if (!t) return out;
+      out.title = t.title || null;
+      out.artist = t.artist || null;
+      if (t.picture && t.picture.data) {
+        try {
+          const byteArr = new Uint8Array(t.picture.data);
+          out.coverUrl = URL.createObjectURL(new Blob([byteArr], { type: t.picture.format }));
+        } catch (e) {
+          out.coverUrl = null;
+        }
+      }
+      if (t.lyrics) {
+        if (typeof t.lyrics === 'string') out.lrc = t.lyrics;
+        else if (t.lyrics.lyrics) out.lrc = t.lyrics.lyrics;
+        else if (t.lyrics.data && t.lyrics.data.lyrics) out.lrc = t.lyrics.data.lyrics;
+      } else if (t.USLT && t.USLT.data) {
+        out.lrc = t.USLT.data.lyrics || t.USLT.data || '';
+      }
+      return out;
+    }
+
+    async function readEmbeddedTags(url) {
+      try {
+        const jmt = await getJsMediaTags();
+        if (!jmt) return null;
+        const tagUrl = new URL(url, window.location.href).href;
+        return await new Promise((resolve) => {
+          let settled = false;
+          const done = (value) => { if (!settled) { settled = true; resolve(value); } };
+          const reader = jmt.read(tagUrl, {
+            onSuccess: (tag) => done(normalizeTags(tag.tags)),
+            onError: () => done(null)
+          });
+          if (tagAbort) {
+            const cancelTagRead = () => { done(null); if (reader && typeof reader.abort === 'function') { try { reader.abort(); } catch (e) {} } };
+            if (tagAbort.signal.aborted) {
+              cancelTagRead();
+            } else {
+              tagAbort.signal.addEventListener('abort', cancelTagRead);
+            }
+          }
+        });
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function trimTagCache(keepKey, shownKey) {
+      const snapshot = [...tagCache.keys()];
+      for (const tagKey of snapshot) {
+        if (tagCache.size <= TAG_CACHE_MAX) break;
+        if (tagKey === keepKey || tagKey === shownKey) continue;
+        const entry = tagCache.get(tagKey);
+        if (entry && entry.coverUrl) URL.revokeObjectURL(entry.coverUrl);
+        tagCache.delete(tagKey);
+      }
+    }
+
+    function renderTags(tags, fallbackTitle) {
+      document.getElementById('stitle').textContent = (tags && tags.title) || fallbackTitle;
+      document.getElementById('sartist').textContent = (tags && tags.artist) || "未知艺术家";
+      const tagTitle = (tags && tags.title) || fallbackTitle;
+      document.title = tagTitle + " | " + (siteTitle || "Cloud Music Hub");
+      if (navigator.mediaSession && window.MediaMetadata) {
+        try {
+          const coverUrl = tags && tags.coverUrl ? tags.coverUrl : '';
+          navigator.mediaSession.metadata = new window.MediaMetadata({ title: tagTitle, artist: (tags && tags.artist) || '', artwork: coverUrl ? [{ src: coverUrl }] : [] });
+        } catch (e) {}
+      }
+      const cover = document.getElementById('cover');
+      resetCoverAmbient();
+      if (tags && tags.coverUrl && cover) {
+        cover.onload = () => { if (cover.src !== tags.coverUrl) return; applyCoverAmbient(cover); };
+        cover.onerror = () => { if (cover.src === tags.coverUrl) resetCoverAmbient(); };
+        cover.src = tags.coverUrl;
+      }
+      renderLrc(tags ? tags.lrc : '');
+    }
+
+    async function parseAndCacheTags(song, url, token) {
+      const key = songKey(song);
+      if (key === null) return;
+      const cached = tagCache.get(key);
+      if (cached) {
+        if (token === playToken) renderTags(cached, song.name);
+        return;
+      }
+      const tags = await readEmbeddedTags(url);
+      if (tags) {
+        if (tagCache.has(key)) {
+          const discardedCoverUrl = tags.coverUrl;
+          if (discardedCoverUrl) URL.revokeObjectURL(discardedCoverUrl);
+        } else {
+          tagCache.set(key, tags);
+        }
+        trimTagCache(key, songKey(currentSongRef));
+      }
+      if (token !== playToken) return;
+      if (!tags) {
+        renderTags(null, song.name);
+        return;
+      }
+      renderTags(tagCache.get(key) || tags, song.name);
+    }
+
+    audio.onplaying = () => {
+      waitingForGesture = false;
+      externallyPaused = false;
+      resetStallMarks();
+      startStallHeartbeat();
+    };
+    audio.onpause = () => {
+      if (!userPaused) {
+        externallyPaused = true;
+        stopStallHeartbeat();
+      }
+    };
+    audio.onstalled = stallHeartbeatTick;
+    audio.onwaiting = stallHeartbeatTick;
+    window.addEventListener('online', () => {
+      if (currentSongRef && !userPaused && !waitingForGesture) stallHeartbeatTick();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && currentSongRef && !userPaused && !waitingForGesture) stallHeartbeatTick();
+    });
+    window.addEventListener('pagehide', () => {
+      const key = songKey(currentSongRef);
+      if (key === null || !isFinite(audio.currentTime) || audio.currentTime < 3) return;
+      try {
+        sessionStorage.setItem(PROGRESS_STORE_KEY, JSON.stringify({ key: key, time: audio.currentTime, at: Date.now() }));
+      } catch (e) {}
+    });
 
     function renderLrc(lrcText) {
       const container = document.getElementById('lrc-content');

@@ -70,6 +70,101 @@ function resolveWebDavUrl(baseUrl, href) {
   }
 }
 
+function parseSingleByteRange(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  const suffixMatch = /^bytes=-(\d+)$/.exec(trimmed);
+  if (suffixMatch) {
+    const suffix = parseInt(suffixMatch[1], 10);
+    if (!isFinite(suffix) || suffix <= 0) return null;
+    return { start: null, end: null, suffix: suffix };
+  }
+  const match = /^bytes=(\d+)-(\d*)$/.exec(trimmed);
+  if (!match) return null;
+  const start = parseInt(match[1], 10);
+  if (!isFinite(start) || start < 0) return null;
+  if (match[2] === "") return { start: start, end: null, suffix: null };
+  const end = parseInt(match[2], 10);
+  if (!isFinite(end) || end < start) return null;
+  return { start: start, end: end, suffix: null };
+}
+
+const AUDIO_CONTENT_TYPES = {
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  mp4: "audio/mp4",
+  alac: "audio/mp4",
+  flac: "audio/flac",
+  ogg: "audio/ogg",
+  oga: "audio/ogg",
+  opus: "audio/ogg",
+  wav: "audio/wav",
+  aac: "audio/aac",
+  ape: "audio/x-ape",
+  wma: "audio/x-ms-wma",
+  mka: "audio/x-matroska",
+  dsd: "audio/x-dsf",
+  dsf: "audio/x-dsf",
+  dff: "audio/x-dff"
+};
+
+function audioContentTypeFor(fileName) {
+  const name = String(fileName || "");
+  const dot = name.lastIndexOf(".");
+  if (dot < 0 || dot === name.length - 1) return null;
+  return AUDIO_CONTENT_TYPES[name.slice(dot + 1).toLowerCase()] || null;
+}
+
+function sliceReadableStream(stream, start, count) {
+  if (!stream || !(count > 0)) return null;
+  const reader = stream.getReader();
+  let skipped = 0;
+  let sent = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        while (sent < count) {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            if (sent < count) {
+              controller.error(new Error("upstream body ended after " + sent + " of " + count + " bytes"));
+            } else {
+              controller.close();
+            }
+            return;
+          }
+          let value = chunk.value;
+          if (skipped < start) {
+            const remain = start - skipped;
+            if (value.byteLength <= remain) {
+              skipped += value.byteLength;
+              continue;
+            }
+            value = value.subarray(remain);
+            skipped = start;
+          }
+          if (sent + value.byteLength > count) {
+            value = value.subarray(0, count - sent);
+          }
+          sent += value.byteLength;
+          controller.enqueue(value);
+          if (sent >= count) {
+            controller.close();
+            reader.cancel().catch(() => {});
+          }
+          return;
+        }
+        controller.close();
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    }
+  });
+}
+
 async function fetchWebDavList(src) {
   let targetUrl = src.url.endsWith("/") ? src.url : src.url + "/";
 
