@@ -10,8 +10,8 @@ function compactTemplate(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-const GOLDEN_SHA256 = "4552f6309eaeffb87f1a5a2712c6c0c5d6f891cb82817ef44a78121534a1d17f";
-const GOLDEN_LENGTH = 108409;
+const GOLDEN_SHA256 = "a496f86595331590205f321c0c85dadcc04ff3f49d64d87be0c2f856ff8e85d3";
+const GOLDEN_LENGTH = 109339;
 
 test("Tier-3 renderHTML snapshot: golden length & sha256 master", () => {
   const html = renderHTML();
@@ -103,7 +103,11 @@ test("Tier-3 playback resilience lock: heartbeat watchdog, resume and tag cache 
   assert.ok(html.includes("function recoverPlayback()"));
   assert.ok(html.includes("function stallHeartbeatTick()"));
   assert.ok(html.includes("stallHeartbeat = window.setInterval(stallHeartbeatTick, STALL_HEARTBEAT_MS);"));
-  assert.ok(html.includes("if (!currentSongRef || userPaused || waitingForGesture || externallyPaused) return;"));
+  assert.ok(html.includes("if (!currentSongRef || userPaused || externallyPaused) return;"), "the heartbeat must no longer mute on waitingForGesture alone");
+  assert.ok(!html.includes("userPaused || waitingForGesture || externallyPaused"), "the old waitingForGesture-muting guard must be gone");
+  assert.ok(html.includes("if (waitingForGesture) { tryResumeGesture(); return; }"), "a gesture-pending watchdog must attempt one resume per heartbeat");
+  assert.ok(html.includes("function tryResumeGesture()"), "the gesture-resume helper must exist");
+  assert.ok(html.includes("audio.oncanplay = () => {"), "the buffered auto-resume wiring must exist");
   assert.ok(!html.includes("function armStallWatch"), "the event-armed watchdog must be fully replaced by the heartbeat");
   assert.ok(html.includes("waitingForGesture = true;"));
   assert.ok(html.includes("pendingSeek = lastKnownProgress(song);"));

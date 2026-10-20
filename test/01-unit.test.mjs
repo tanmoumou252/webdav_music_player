@@ -508,3 +508,17 @@ test("build.mjs --verify-staged audits the git index, not only the working tree"
   assert.ok(src.includes('["ls-files", "--cached", "-z", "--", "src"]'), "verify-staged must enumerate the staged src/*.part.js set via git ls-files");
   assert.ok(src.includes('["show", ":" + name]'), "verify-staged must read and compare each staged blob via git show :<path>");
 });
+
+test("parseContentRangeTotal: derives the full length from a Content-Range value", () => {
+  assert.equal(P.parseContentRangeTotal("bytes 0-0/9245049"), 9245049, "206 head probe: total after the slash, never the slice length");
+  assert.equal(P.parseContentRangeTotal("bytes 497-499/500"), 500);
+  assert.equal(P.parseContentRangeTotal("bytes */0"), 0, "empty file measured exactly at the boundary is 0, distinct from invalid");
+  assert.equal(P.parseContentRangeTotal("bytes */500"), 500, "a 416 passthrough still carries the total");
+  assert.equal(P.parseContentRangeTotal("bytes 10-19/500   "), 500, "trailing whitespace tolerated");
+  assert.equal(P.parseContentRangeTotal("bytes 0-0/ 500"), 500, "whitespace after the slash tolerated");
+  assert.equal(P.parseContentRangeTotal(null), null, "missing header degrades to null so the library falls back to a GET size probe");
+  assert.equal(P.parseContentRangeTotal(""), null);
+  assert.equal(P.parseContentRangeTotal("bytes 0-0/*"), null, "open-ended total is not a number");
+  assert.equal(P.parseContentRangeTotal("bytes 0-0/512x512"), null, "trailing non-digits are not silently truncated");
+  assert.equal(P.parseContentRangeTotal("bytes 0-19"), null, "no slash means no total");
+});

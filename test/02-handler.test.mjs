@@ -307,3 +307,94 @@ test("stream Range degraded passthrough: a content-encoded whole body carries no
     assert.equal(res.headers.get("accept-ranges"), null, "E2: a degraded whole-body response must not advertise Range support the very response refused to slice");
   } finally { globalThis.fetch = prevFetch; }
 });
+
+test("stream HEAD: an origin that refuses HEAD but serves GET must yield a 2xx size probe so jsmediatags can read tags", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  const forwarded = [];
+  const probeHeaders = [];
+  globalThis.fetch = async (_input, init) => {
+    const m = (init && init.method) || "GET";
+    forwarded.push(m);
+    probeHeaders.push(Object.fromEntries(new Headers(init && init.headers ? init.headers : {}).entries()));
+    if (m === "HEAD") return new Response(null, { status: 403, statusText: "Forbidden", headers: { "content-type": "text/plain" } });
+    return new Response("x", { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": "bytes 0-0/9245049", "content-length": "1", "content-encoding": "gzip" } });
+  };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "HEAD", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3" }), env);
+    assert.equal(res.status, 200, "HEAD must be answered 200, never the origin's 403 (jsmediatags size-probe contract)");
+    const body = await res.text();
+    assert.equal(body, "", "a HEAD response must carry no body");
+    assert.equal(res.headers.get("content-length"), "9245049", "the probe must advertise the total from Content-Range, not the 1-byte slice length");
+    assert.equal(res.headers.get("accept-ranges"), "bytes", "range support must be advertised so the library may issue ID3 tail reads");
+    assert.deepEqual(forwarded, ["GET"], "the worker must re-probe with a GET range, never forward the refused HEAD");
+    assert.equal(probeHeaders[0]["accept-encoding"], "identity", "the size probe must pin identity so a compressed length can never masquerade as the byte total (ATK-4)");
+    assert.equal(probeHeaders[0]["range"], "bytes=0-0", "the size probe must request a single byte, never the whole file");
+    assert.equal(res.headers.get("content-encoding"), null, "the synthesized HEAD answer must carry no upstream Content-Encoding (fresh headers)");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream HEAD: a genuine upstream 404 on the GET probe is surfaced, never masked as 200", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("Not Found", { status: 404, statusText: "Not Found", headers: { "content-type": "text/plain" } });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "HEAD", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3" }), env);
+    assert.equal(res.status, 404, "a real 404 on the probe must not be turned into a fake 200");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream HEAD: a malformed 206 with no Content-Range omits Content-Length so jsmediatags falls back to a GET size probe", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("x", { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-length": "1" } });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "HEAD", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3" }), env);
+    assert.equal(res.status, 200, "still answered, not the origin 403");
+    assert.equal(res.headers.get("content-length"), null, "an undeterminable total must OMIT Content-Length (never a fake 0) so the library's _fetchSizeWithGetRequest fallback runs");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream HEAD: a genuinely empty file (whole 200 with Content-Length 0) is answered with Content-Length 0, distinguishing measured-zero from unknown", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("", { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "0" } });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "HEAD", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3" }), env);
+    assert.equal(res.status, 200, "an empty file is still answered, not the origin 403");
+    assert.equal(res.headers.get("content-length"), "0", "a measured 0 total is advertised as Content-Length: 0 (NOT omitted) — the boundary that separates 实测恰等于 0 from 未知 null 省略头");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream HEAD: a path-validation failure stays 403 regardless of method and never reaches the size probe", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  let probed = false;
+  globalThis.fetch = async () => { probed = true; return new Response("x", { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": "bytes 0-0/10", "content-length": "1" } }); };
+  try {
+    const escape = await worker.fetch(makeRequest({ method: "HEAD", url: "https://app.example.com/api/stream?sourceId=a&file=" + encodeURIComponent("../secret.mp3") }), env);
+    assert.equal(escape.status, 403, "a traversal HEAD must hit the method-agnostic streamPathReject (ATK-5), before any HEAD rewrite");
+    const notAudio = await worker.fetch(makeRequest({ method: "HEAD", url: "https://app.example.com/api/stream?sourceId=a&file=notes.txt" }), env);
+    assert.equal(notAudio.status, 403, "a non-audio HEAD must be rejected by the extension whitelist before any probe");
+    assert.equal(probed, false, "a rejected path must never forward a probe to the origin (no path leak via the HEAD rewrite)");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream GET playback path is untouched by the HEAD interception: the same origin still streams 206", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  const prevFetch = globalThis.fetch;
+  const forwarded = [];
+  globalThis.fetch = async (_input, init) => {
+    const m = (init && init.method) || "GET";
+    forwarded.push(m);
+    if (m === "HEAD") return new Response(null, { status: 403, headers: { "content-type": "text/plain" } });
+    return new Response("0123456789", { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": "bytes 0-9/10", "content-length": "10" } });
+  };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3", headers: { range: "bytes=0-9" } }), env);
+    assert.equal(res.status, 206, "a GET must still be forwarded verbatim and proxied as before");
+    assert.deepEqual(forwarded, ["GET"], "a GET is never converted to a GET probe with a forced Range");
+    const body = await res.text();
+    assert.equal(body, "0123456789", "the GET body streams through unchanged");
+  } finally { globalThis.fetch = prevFetch; }
+});

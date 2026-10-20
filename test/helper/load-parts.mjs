@@ -78,6 +78,7 @@ const HANDLES = [
   "fetchWebDavList",
   "parseSingleByteRange",
   "audioContentTypeFor",
+  "parseContentRangeTotal",
   "sliceReadableStream",
   "renderHTML",
 ];

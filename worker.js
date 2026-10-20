@@ -417,6 +417,8 @@ export default {
         return streamPathReject(targetUrl, request.method, src.name, corsHeaders, await requireAdminSafe());
       }
 
+      const isHead = request.method === "HEAD";
+
       const forwardHeaders = new Headers();
       if (src.user || src.pass) {
         forwardHeaders.set("Authorization", "Basic " + btoa(unescape(encodeURIComponent(`${src.user || ""}:${src.pass || ""}`))));
@@ -428,11 +430,39 @@ export default {
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
+      if (isHead) {
+        forwardHeaders.set("Range", "bytes=0-0");
+        forwardHeaders.set("Accept-Encoding", "identity");
+      }
+
       try {
         const res = await fetch(targetUrl, {
-          method: request.method,
+          method: isHead ? "GET" : request.method,
           headers: forwardHeaders
         });
+
+        if (isHead && (res.ok || res.status === 206 || res.status === 416)) {
+          let headTotal = parseContentRangeTotal(res.headers.get("Content-Range"));
+          if (headTotal === null && res.status === 200) {
+            const headLength = res.headers.get("Content-Length");
+            headTotal = headLength && /^\d+$/.test(headLength) ? parseInt(headLength, 10) : null;
+          }
+          const headHeaders = new Headers();
+          headHeaders.set("Access-Control-Allow-Origin", "*");
+          headHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
+          headHeaders.set("Access-Control-Allow-Headers", "*");
+          headHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+          headHeaders.set("Accept-Ranges", "bytes");
+          const headType = res.headers.get("Content-Type") || audioContentTypeFor(rawFile);
+          if (headType) headHeaders.set("Content-Type", headType);
+          if (headTotal !== null) headHeaders.set("Content-Length", String(headTotal));
+          const headLastModified = res.headers.get("Last-Modified");
+          if (headLastModified) headHeaders.set("Last-Modified", headLastModified);
+          const headEtag = res.headers.get("ETag");
+          if (headEtag) headHeaders.set("ETag", headEtag);
+          try { if (res.body) res.body.cancel(); } catch (cancelErr) {}
+          return new Response(null, { status: 200, statusText: "OK", headers: headHeaders });
+        }
 
         if (res.status === 416) {
           const rangeRejectHeaders = new Headers(res.headers);
@@ -919,6 +949,14 @@ function audioContentTypeFor(fileName) {
   const dot = name.lastIndexOf(".");
   if (dot < 0 || dot === name.length - 1) return null;
   return AUDIO_CONTENT_TYPES[name.slice(dot + 1).toLowerCase()] || null;
+}
+
+function parseContentRangeTotal(value) {
+  if (!value) return null;
+  const match = /\/\s*(\d+)\s*$/.exec(String(value).trim());
+  if (!match) return null;
+  const total = parseInt(match[1], 10);
+  return Number.isFinite(total) && total >= 0 ? total : null;
 }
 
 function sliceReadableStream(stream, start, count) {
@@ -2592,8 +2630,14 @@ function renderHTML() {
             return;
           }
         }
-        audio.play();
-        document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+        const resumePlay = audio.play();
+        if (resumePlay && typeof resumePlay.then === "function") {
+          resumePlay.then(function () {
+            document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+          }).catch(function () {});
+        } else {
+          document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+        }
       } else {
         userPaused = true;
         stopStallHeartbeat();
@@ -2839,7 +2883,8 @@ function renderHTML() {
     }
 
     function stallHeartbeatTick() {
-      if (!currentSongRef || userPaused || waitingForGesture || externallyPaused) return;
+      if (!currentSongRef || userPaused || externallyPaused) return;
+      if (waitingForGesture) { tryResumeGesture(); return; }
       if (audio.currentTime > lastProgressTime + 0.1) {
         lastProgressTime = audio.currentTime;
         lastProgressAt = Date.now();
@@ -2978,11 +3023,29 @@ function renderHTML() {
       renderTags(tagCache.get(key) || tags, song.name);
     }
 
+    function tryResumeGesture() {
+      if (!currentSongRef || userPaused || externallyPaused) return;
+      if (!audio.paused) return;
+      const resumePromise = audio.play();
+      if (resumePromise && typeof resumePromise.then === "function") {
+        resumePromise.then(function () {
+          if (!userPaused && !externallyPaused) {
+            waitingForGesture = false;
+            document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+          }
+        }).catch(function () {});
+      }
+    }
+
     audio.onplaying = () => {
       waitingForGesture = false;
       externallyPaused = false;
       resetStallMarks();
       startStallHeartbeat();
+    };
+
+    audio.oncanplay = () => {
+      if (waitingForGesture) tryResumeGesture();
     };
     audio.onpause = () => {
       if (!userPaused) {

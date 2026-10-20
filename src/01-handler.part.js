@@ -417,6 +417,8 @@ export default {
         return streamPathReject(targetUrl, request.method, src.name, corsHeaders, await requireAdminSafe());
       }
 
+      const isHead = request.method === "HEAD";
+
       const forwardHeaders = new Headers();
       if (src.user || src.pass) {
         forwardHeaders.set("Authorization", "Basic " + btoa(unescape(encodeURIComponent(`${src.user || ""}:${src.pass || ""}`))));
@@ -428,11 +430,39 @@ export default {
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
+      if (isHead) {
+        forwardHeaders.set("Range", "bytes=0-0");
+        forwardHeaders.set("Accept-Encoding", "identity");
+      }
+
       try {
         const res = await fetch(targetUrl, {
-          method: request.method,
+          method: isHead ? "GET" : request.method,
           headers: forwardHeaders
         });
+
+        if (isHead && (res.ok || res.status === 206 || res.status === 416)) {
+          let headTotal = parseContentRangeTotal(res.headers.get("Content-Range"));
+          if (headTotal === null && res.status === 200) {
+            const headLength = res.headers.get("Content-Length");
+            headTotal = headLength && /^\d+$/.test(headLength) ? parseInt(headLength, 10) : null;
+          }
+          const headHeaders = new Headers();
+          headHeaders.set("Access-Control-Allow-Origin", "*");
+          headHeaders.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
+          headHeaders.set("Access-Control-Allow-Headers", "*");
+          headHeaders.set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+          headHeaders.set("Accept-Ranges", "bytes");
+          const headType = res.headers.get("Content-Type") || audioContentTypeFor(rawFile);
+          if (headType) headHeaders.set("Content-Type", headType);
+          if (headTotal !== null) headHeaders.set("Content-Length", String(headTotal));
+          const headLastModified = res.headers.get("Last-Modified");
+          if (headLastModified) headHeaders.set("Last-Modified", headLastModified);
+          const headEtag = res.headers.get("ETag");
+          if (headEtag) headHeaders.set("ETag", headEtag);
+          try { if (res.body) res.body.cancel(); } catch (cancelErr) {}
+          return new Response(null, { status: 200, statusText: "OK", headers: headHeaders });
+        }
 
         if (res.status === 416) {
           const rangeRejectHeaders = new Headers(res.headers);

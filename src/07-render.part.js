@@ -1506,8 +1506,14 @@ function renderHTML() {
             return;
           }
         }
-        audio.play();
-        document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+        const resumePlay = audio.play();
+        if (resumePlay && typeof resumePlay.then === "function") {
+          resumePlay.then(function () {
+            document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+          }).catch(function () {});
+        } else {
+          document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+        }
       } else {
         userPaused = true;
         stopStallHeartbeat();
@@ -1753,7 +1759,8 @@ function renderHTML() {
     }
 
     function stallHeartbeatTick() {
-      if (!currentSongRef || userPaused || waitingForGesture || externallyPaused) return;
+      if (!currentSongRef || userPaused || externallyPaused) return;
+      if (waitingForGesture) { tryResumeGesture(); return; }
       if (audio.currentTime > lastProgressTime + 0.1) {
         lastProgressTime = audio.currentTime;
         lastProgressAt = Date.now();
@@ -1892,11 +1899,29 @@ function renderHTML() {
       renderTags(tagCache.get(key) || tags, song.name);
     }
 
+    function tryResumeGesture() {
+      if (!currentSongRef || userPaused || externallyPaused) return;
+      if (!audio.paused) return;
+      const resumePromise = audio.play();
+      if (resumePromise && typeof resumePromise.then === "function") {
+        resumePromise.then(function () {
+          if (!userPaused && !externallyPaused) {
+            waitingForGesture = false;
+            document.getElementById('play-icon').setAttribute('href', '#icon-pause');
+          }
+        }).catch(function () {});
+      }
+    }
+
     audio.onplaying = () => {
       waitingForGesture = false;
       externallyPaused = false;
       resetStallMarks();
       startStallHeartbeat();
+    };
+
+    audio.oncanplay = () => {
+      if (waitingForGesture) tryResumeGesture();
     };
     audio.onpause = () => {
       if (!userPaused) {
