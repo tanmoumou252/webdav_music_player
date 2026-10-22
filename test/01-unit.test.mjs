@@ -1,6 +1,8 @@
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
 import { parseGoldenRecord } from "./tools/record.mjs";
 import { loadParts } from "./helper/load-parts.mjs";
 import { createKV } from "./helper/kv.mjs";
@@ -332,6 +334,25 @@ test("fetchWebDavList: empty / non-audio / waf / html / network-throw", async ()
   }
 });
 
+test("D-2 fetchWebDavList: a hung PROPFIND is aborted into a status-0 diagnostic, never an infinite wait", async () => {
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
+    const sig = init && init.signal;
+    if (sig) { if (sig.aborted) return reject(sig.reason); sig.addEventListener("abort", () => reject(sig.reason)); }
+    // else hang forever
+  });
+  try {
+    const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("guard: fetchWebDavList hung past 3s")), 3000));
+    const res = await Promise.race([
+      P.fetchWebDavList({ id: "x", name: "挂起源", url: "https://hang.example.com/dav/" }, { STREAM_FETCH_TIMEOUT_MS: "500" }),
+      guard,
+    ]);
+    assert.equal(res.debug.status, 0, "a PROPFIND timeout must surface as a status-0 diagnostic result, not throw/hang");
+    assert.ok(res.diagnostic, "the timeout must produce a diagnostic");
+    assert.deepEqual(res.items, [], "a timed-out listing yields no items");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
 test("server escapeHtmlText null-guard differs from client escapeHtml by design (no unify)", () => {
   assert.equal(P.escapeHtmlText(null), "");
   const html = P.renderHTML();
@@ -392,6 +413,79 @@ test("sliceReadableStream: exact prefix skip, exact count, early cancel", async 
   assert.deepEqual(Array.from(new Uint8Array(c)), [2, 3]);
   assert.equal(P.sliceReadableStream(null, 0, 5), null);
   assert.equal(P.sliceReadableStream(source([[9]]), 0, 0), null);
+});
+
+test("sliceReadableStream coalescing: 1KB chunks coalesce into a single output chunk for a 4KB slice", async () => {
+  const KB = 1024;
+  const mk = (n, fill) => new Uint8Array(n).fill(fill);
+  const streamOf = (chunks) => new ReadableStream({ start(c) { for (const ch of chunks) c.enqueue(ch); c.close(); } });
+  const readChunks = async (stream) => {
+    const out = [];
+    const r = stream.getReader();
+    for (;;) {
+      const res = await r.read();
+      if (res.done) return out;
+      out.push(res.value);
+    }
+  };
+  const agg = await readChunks(P.sliceReadableStream(streamOf([mk(KB, 1), mk(KB, 2), mk(KB, 3), mk(KB, 4)]), 0, KB * 4));
+  assert.equal(agg.length, 1, "J1: four 1KB chunks must flush once when count is met");
+  assert.deepEqual(Array.from(agg[0].slice(0, 4)), [1, 1, 1, 1], "byte order preserved across buffered chunks");
+  const bigPass = await readChunks(P.sliceReadableStream(streamOf([mk(KB * 256, 7)]), 0, KB * 256));
+  assert.equal(bigPass.length, 1, "J1: a chunk at/above FLUSH_BYTES passes through in one piece");
+  assert.equal(bigPass[0].every((b) => b === 7), true);
+  const mixed = await readChunks(P.sliceReadableStream(streamOf([mk(2, 1), mk(KB * 256, 2)]), 0, KB * 256 + 2));
+  assert.equal(mixed.length, 2, "J1: pending small chunk flushes before the big chunk, order preserved");
+  assert.equal(mixed[0].byteLength, 2);
+  assert.equal(mixed[1].byteLength, KB * 256);
+  const emptyIn = await readChunks(P.sliceReadableStream(streamOf([mk(KB, 1), new Uint8Array(0), mk(KB, 3), new Uint8Array(0)]), 0, KB * 2));
+  assert.equal(emptyIn.length, 1, "J1: zero-byte chunks never produce standalone output pieces");
+  assert.equal(emptyIn[0].byteLength, KB * 2);
+  const skipCross = await readChunks(P.sliceReadableStream(streamOf([mk(2, 9), mk(2, 8), mk(6, 7)]), 5, 3));
+  assert.equal(skipCross.length, 1);
+  assert.deepEqual(Array.from(skipCross[0]), [7, 7, 7], "J1: skipped bytes must never leak into the coalesce buffer");
+  const one = await readChunks(P.sliceReadableStream(streamOf([mk(KB, 5)]), 0, 1));
+  assert.equal(one.length, 1, "J1: count=1 emits exactly one byte-chunk");
+  assert.equal(one[0].byteLength, 1);
+  const exactFill = await readChunks(P.sliceReadableStream(streamOf([mk(2, 1), mk(2, 2)]), 0, 4));
+  assert.equal(exactFill.length, 1, "J1: upstream done exactly at count closes after one flush, never errors");
+  await assert.rejects(async () => {
+    await readChunks(P.sliceReadableStream(streamOf([mk(2, 1), mk(2, 2)]), 0, 5));
+  }, /ended after 4 of 5/, "A2: the error message keeps the received-so-far accounting");
+  let fedBytes = 0;
+  let idx = 0;
+  const longSource = new ReadableStream({
+    pull(c) {
+      if (idx >= 300) { c.close(); return; }
+      idx += 1; fedBytes += 1024; c.enqueue(mk(1024, 3));
+    }
+  });
+  const smallCount = await readChunks(P.sliceReadableStream(longSource, 0, 1000));
+  assert.ok(smallCount.reduce((n, ch) => n + ch.byteLength, 0) >= 1000, "J1: the requested bytes must be delivered");
+  assert.ok(fedBytes < 300 * 1024, "J1-生死线: a 1000-byte slice must cancel the long source early, fed " + fedBytes);
+  let fed2 = 0;
+  let idx2 = 0;
+  const midSource = new ReadableStream({
+    pull(c) {
+      if (idx2 >= 70) { c.close(); return; }
+      idx2 += 1; fed2 += 1024; c.enqueue(mk(1024, 9));
+    }
+  });
+  const midReader = P.sliceReadableStream(midSource, 0, 70000).getReader();
+  const first = await midReader.read();
+  assert.equal(first.value.byteLength, 32768, "J1: the first output piece is capped at FLUSH_BYTES");
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(fed2 <= 66 * 1024, "J1: after delivering a piece the pull must yield — reads may run at most one hwm-prefilled piece ahead, never drain the source: fed " + fed2);
+  const pieces = [first.value];
+  for (;;) {
+    const res = await midReader.read();
+    if (res.done) break;
+    assert.ok(res.value.byteLength <= 32768, "J1: every coalesced piece stays capped at FLUSH_BYTES");
+    pieces.push(res.value);
+  }
+  let midTotal = 0;
+  for (const ch of pieces) midTotal += ch.byteLength;
+  assert.equal(midTotal, 70000, "J1: all requested bytes delivered across yielded pulls, byte sum preserved");
 });
 
 test("normalizeShareIndexPairs: dedup to newest, validates id/name, keeps the head 20000", () => {
@@ -521,4 +615,486 @@ test("parseContentRangeTotal: derives the full length from a Content-Range value
   assert.equal(P.parseContentRangeTotal("bytes 0-0/*"), null, "open-ended total is not a number");
   assert.equal(P.parseContentRangeTotal("bytes 0-0/512x512"), null, "trailing non-digits are not silently truncated");
   assert.equal(P.parseContentRangeTotal("bytes 0-19"), null, "no slash means no total");
+});
+
+test("parseUpstreamTimeoutMs: degenerate env knob values never yield NaN or sub-500ms timers", () => {
+  assert.equal(P.parseUpstreamTimeoutMs(undefined), 8000, "S-1: missing knob falls back to default");
+  assert.equal(P.parseUpstreamTimeoutMs(null), 8000, "S-1: null falls back");
+  assert.equal(P.parseUpstreamTimeoutMs("abc"), 8000, "S-1: non-numeric string must NEVER become NaN");
+  assert.equal(P.parseUpstreamTimeoutMs("0"), 8000, "S-1: zero is not a valid timeout");
+  assert.equal(P.parseUpstreamTimeoutMs("-5"), 8000, "S-1: negative is not a valid timeout");
+  assert.equal(P.parseUpstreamTimeoutMs({}), 8000, "S-1: object falls back");
+  assert.equal(P.parseUpstreamTimeoutMs("20"), 500, "S-1: sub-floor values clamp up to 500ms");
+  assert.equal(P.parseUpstreamTimeoutMs(7000), 7000, "S-1: in-range number passes through");
+  assert.equal(P.parseUpstreamTimeoutMs("7000"), 7000, "S-1: numeric string parses");
+  assert.equal(P.parseUpstreamTimeoutMs(1e9), 300000, "S-1: huge values clamp to the 300s ceiling");
+});
+
+// ---- D-8 属性/变异测试辅助（零依赖，自包含；只读 src，不改任何被测函数） ----
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const SRC06 = readFileSync(join(process.cwd(), "src", "06-webdav.part.js"), "utf8");
+function extractFnSource(name) {
+  const start = SRC06.indexOf("function " + name + "(");
+  assert.notEqual(start, -1, "extractFnSource: function " + name + " must exist in src/06");
+  const braceOpen = SRC06.indexOf("{", SRC06.indexOf(")", start));
+  assert.notEqual(braceOpen, -1, "extractFnSource: body-open for " + name);
+  let depth = 0, i = braceOpen;
+  for (; i < SRC06.length; i++) {
+    const c = SRC06[i];
+    if (c === "{") depth++;
+    else if (c === "}") { depth--; if (depth === 0) { i++; break; } }
+  }
+  return SRC06.slice(start, i);
+}
+function evalHandle(fnText) {
+  return new Function("return " + fnText)();
+}
+function sourceOf(chunks) {
+  return new ReadableStream({ start(c) { for (const ch of chunks) c.enqueue(new Uint8Array(ch)); c.close(); } });
+}
+async function collectSlices(stream) {
+  const reader = stream.getReader();
+  const pieces = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    pieces.push(value);
+  }
+  return pieces;
+}
+function randParts(rng, total) {
+  const parts = [];
+  let i = 0;
+  while (i < total) {
+    const len = Math.min(total - i, 1 + Math.floor(rng() * 700));
+    parts.push(len);
+    i += len;
+  }
+  return parts;
+}
+
+// INV-A/B/C：字节守恒 + 确定性 + 缓冲上界，跨随机切分 × 随机 start/count
+test("D-8 INV-A/B/C sliceReadableStream: conservation, determinism, flush-bound hold across randomized chunking", async () => {
+  const FLUSH = 32768; // 契约：src/06:142 合并界（与既有 test/01:455/462 同源），非抄实跑输出
+  const rng = mulberry32(0x9E3779B9);
+  const slice = evalHandle(extractFnSource("sliceReadableStream"));
+  for (let round = 0; round < 64; round++) {
+    const total = 1 + Math.floor(rng() * 5000);
+    const bytes = [];
+    for (let k = 0; k < total; k++) bytes.push((k * 131 + round * 17) & 0xff);
+    const lens = randParts(rng, total);
+    const chunks = [];
+    let off = 0;
+    for (const L of lens) { chunks.push(bytes.slice(off, off + L)); off += L; }
+    const start = Math.floor(rng() * total);
+    const maxCount = total - start;
+    const count = 1 + Math.floor(rng() * maxCount); // 满额区间：start+count<=total
+    const p1 = await collectSlices(slice(sourceOf(chunks), start, count));
+    const p2 = await collectSlices(slice(sourceOf(chunks), start, count)); // INV-B 确定性
+    const flat1 = [].concat(...p1.map((a) => Array.from(a)));
+    const flat2 = [].concat(...p2.map((a) => Array.from(a)));
+    assert.deepEqual(flat1, bytes.slice(start, start + count), "INV-A conservation round " + round);
+    assert.deepEqual(flat2, flat1, "INV-B determinism round " + round);
+    for (const piece of p1) assert.ok(piece.byteLength <= FLUSH, "INV-C flush-bound round " + round); // INV-C
+  }
+  // INV-A 短读：start+count>total 必 error（含 start>=total 退化）
+  for (let round = 0; round < 16; round++) {
+    const total = 1 + Math.floor(rng() * 2000);
+    const bytes = [];
+    for (let k = 0; k < total; k++) bytes.push(k & 0xff);
+    const chunks = [];
+    let off = 0;
+    for (const L of randParts(rng, total)) { chunks.push(bytes.slice(off, off + L)); off += L; }
+    const start = Math.floor(rng() * (total + 50)); // 可越界
+    const count = 1 + Math.floor(rng() * 300);
+    if (start + count <= total) continue;
+    await assert.rejects(
+      () => new Response(slice(sourceOf(chunks), start, count)).arrayBuffer(),
+      /ended after \d+ of \d+/,
+      "INV-A short-read must hard-error round " + round
+    );
+  }
+});
+
+// INV-D：parseSingleByteRange 全域形状 + 永不抛
+test("D-8 INV-D parseSingleByteRange: total function, only legal shapes, illegal inputs null", () => {
+  const parse = evalHandle(extractFnSource("parseSingleByteRange"));
+  const illegal = [
+    "0-10", "items=0-1", "BYTES=0-1", "bytes=9-3", "bytes=-0", "bytes=-", "bytes=0-1,5-6",
+    "bytes=a-b", "bytes=", "bytes=-abc", "  ", "", null, undefined, 0, 123, {}, [], true,
+    "bytes=Infinity-", "bytes=-Infinity", "bytes=0-1 , 2-3",
+  ];
+  for (const v of illegal) {
+    let r;
+    assert.doesNotThrow(() => { r = parse(v); }, "INV-D never throws for " + JSON.stringify(v));
+    assert.equal(r, null, "INV-D illegal must be null: " + JSON.stringify(v));
+  }
+  const legal = ["bytes=0-10", "bytes=5-", "bytes=-100", "bytes=10-10", " bytes=7-9 ", "bytes=0-0"];
+  for (const v of legal) {
+    const r = parse(v);
+    assert.notEqual(r, null, "INV-D legal must parse: " + v);
+    const keys = ["start", "end", "suffix"];
+    const setCount = keys.filter((k) => r[k] !== null && r[k] !== undefined).length;
+    if (r.suffix !== null) { // 后缀形：start/end 必 null，suffix>=1
+      assert.equal(r.start, null, "suffix-form start null: " + v);
+      assert.equal(r.end, null, "suffix-form end null: " + v);
+      assert.ok(r.suffix >= 1, "suffix>=1: " + v);
+    } else {
+      assert.ok(r.start >= 0 && Number.isInteger(r.start), "start>=0 int: " + v);
+      if (r.end !== null) assert.ok(r.end >= r.start, "end>=start: " + v);
+    }
+    assert.ok(setCount <= 2, "shape mutex (at most start+end or just suffix): " + v);
+  }
+});
+
+// INV-M：变异负控——每个缺陷变异必让对应正属性"翻红"，证明上述断言 load-bearing
+test("D-8 INV-M: injected defects flip the positive properties red (anti-green-wash)", async () => {
+  const sliceText = extractFnSource("sliceReadableStream");
+  const parseText = extractFnSource("parseSingleByteRange");
+
+  // M-parse-1: end<start 守卫失效 → bytes=9-3 不该解析成功
+  {
+    assert.ok(parseText.includes("end < start"), "M-parse-1 needle before mutation");
+    const m = parseText.replace("if (!isFinite(end) || end < start) return null;",
+      "if (!isFinite(end)) return null;");
+    assert.ok(m.includes("if (!isFinite(end)) return null;"), "M-parse-1 mutation applied");
+    const p = evalHandle(m);
+    assert.notEqual(p("bytes=9-3"), null, "M-parse-1: guard stripped must let the illegal range through (load-bearing proof)");
+  }
+  // M-parse-2: suffix<=0 守卫失效 → bytes=-0 不该解析成功
+  {
+    assert.ok(parseText.includes("suffix <= 0"), "M-parse-2 needle before mutation");
+    const m = parseText.replace("if (!isFinite(suffix) || suffix <= 0) return null;",
+      "if (!isFinite(suffix)) return null;");
+    const p = evalHandle(m);
+    assert.notEqual(p("bytes=-0"), null, "M-parse-2: suffix-zero guard is load-bearing");
+  }
+  // M-parse-3: 多段被误判 → 把单段正则的尾段放宽允许逗号（探针 bytes=0-1,5：真实现仍拒绝，变异体匹配 "1,5"）
+  {
+    const needle = "const match = /^bytes=(\\d+)-(\\d*)$/.exec(trimmed);";
+    assert.ok(parseText.includes(needle), "M-parse-3 needle before mutation");
+    const m = parseText.replace(needle, "const match = /^bytes=(\\d+)-([\\d,]*)$/.exec(trimmed);");
+    const p = evalHandle(m);
+    assert.notEqual(p("bytes=0-1,5"), null, "M-parse-3: multi-range rejection is load-bearing");
+  }
+  // M-slice-1: 尾截断缺失 → 产出超 count，守恒破
+  {
+    assert.ok(sliceText.includes("value.subarray(0, count - sent)"), "M-slice-1 needle before mutation");
+    const m = sliceText.replace("value = value.subarray(0, count - sent);", "value = value;");
+    const s = evalHandle(m);
+    const out = await collectSlices(s(sourceOf([[1, 2, 3, 4, 5, 6, 7, 8]]), 0, 3));
+    assert.notDeepEqual([].concat(...out.map((a) => Array.from(a))), [1, 2, 3], "M-slice-1: truncation is load-bearing (output must overshoot)");
+  }
+  // M-slice-2: 跳过记账错 → 命中"整块跳过"分支（start=4 落在第 2 块）：变异体 skip 只记 1 字节 → 欠账多跳 → 短读 error 或错位产出，二者皆非 [4,5]
+  {
+    assert.ok(sliceText.includes("skipped += value.byteLength;"), "M-slice-2 needle before mutation");
+    const m = sliceText.replace("skipped += value.byteLength;", "skipped += 1;");
+    const s = evalHandle(m);
+    const got = await collectSlices(s(sourceOf([[0, 1, 2, 3], [4, 5, 6, 7]]), 4, 2)).then(
+      (pieces) => [].concat(...pieces.map((a) => Array.from(a))),
+      () => null // 变异体翻红形态 A：短读 error
+    );
+    assert.notDeepEqual(got, [4, 5], "M-slice-2: skip accounting is load-bearing (mutant must not emit the correct slice)");
+  }
+  // M-slice-3: 短读静默 close → 应 error 却静默 resolve（变异体 close 时 pending 未入队，产出 < count 即证）
+  {
+    assert.ok(sliceText.includes('controller.error(new Error("upstream body ended after "'), "M-slice-3 needle before mutation");
+    const m = sliceText.replace(
+      /controller\.error\(new Error\("upstream body ended after " \+ sent \+ " of " \+ count \+ " bytes"\)\);/,
+      "controller.close();");
+    const s = evalHandle(m);
+    const out = await new Response(s(sourceOf([[1, 2, 3]]), 0, 99)).arrayBuffer();
+    assert.ok(out.byteLength < 99, "M-slice-3: short-read error is load-bearing (mutant silently resolves short, got " + out.byteLength + ")");
+  }
+});
+
+// ---- D-1 三旋钮 INV-PC：parseSegmentConcurrency / parseSegmentPartSize / parseSegmentMaxSegments ----
+test("D-1 INV-PC parseSegmentConcurrency: total function, FALLBACK 3, clamp 1-8", () => {
+  const parse = evalHandle(extractFnSource("parseSegmentConcurrency"));
+  assert.equal(parse(undefined), 3, "missing knob falls back to 3");
+  assert.equal(parse(null), 3);
+  assert.equal(parse("abc"), 3, "non-numeric string must never become NaN");
+  assert.equal(parse("0"), 3, "zero is not a valid concurrency");
+  assert.equal(parse("-1"), 3, "negative falls back");
+  assert.equal(parse("3.5"), 3, "non-integer falls back");
+  assert.equal(parse({}), 3);
+  assert.equal(parse("1"), 1, "in-range passes through");
+  assert.equal(parse(4), 4);
+  assert.equal(parse("8"), 8);
+  assert.equal(parse("2"), 2, "sub-floor values clamp up to 1");
+  assert.equal(parse(0.5), 1, "sub-floor number clamps to 1");
+  assert.equal(parse(1e9), 8, "huge values clamp to the 8 ceiling");
+});
+
+test("D-1 INV-PC parseSegmentPartSize: total function, FALLBACK 1048576, clamp 65536-8388608", () => {
+  const parse = evalHandle(extractFnSource("parseSegmentPartSize"));
+  assert.equal(parse(undefined), 1048576, "missing knob falls back to 1MiB");
+  assert.equal(parse(null), 1048576);
+  assert.equal(parse("abc"), 1048576, "non-numeric string must never become NaN");
+  assert.equal(parse("0"), 1048576, "zero falls back");
+  assert.equal(parse("-1"), 1048576, "negative falls back");
+  assert.equal(parse("1.5"), 1048576, "non-integer falls back");
+  assert.equal(parse("100"), 65536, "sub-floor clamps up to 64KiB");
+  assert.equal(parse(1048576), 1048576, "in-range passes through");
+  assert.equal(parse("2097152"), 2097152, "numeric string parses");
+  assert.equal(parse(1e12), 8388608, "huge values clamp to the 8MiB ceiling");
+});
+
+test("D-1 INV-PC parseSegmentMaxSegments: total function, FALLBACK 16, clamp 1-64", () => {
+  const parse = evalHandle(extractFnSource("parseSegmentMaxSegments"));
+  assert.equal(parse(undefined), 16, "missing knob falls back to 16");
+  assert.equal(parse(null), 16);
+  assert.equal(parse("abc"), 16, "non-numeric string must never become NaN");
+  assert.equal(parse("0"), 16, "zero falls back");
+  assert.equal(parse("-1"), 16, "negative falls back");
+  assert.equal(parse("2.5"), 16, "non-integer falls back");
+  assert.equal(parse("1"), 1, "in-range passes through");
+  assert.equal(parse(16), 16);
+  assert.equal(parse("64"), 64);
+  assert.equal(parse("1000"), 64, "huge values clamp to the 64 ceiling");
+});
+
+// ---- D-1 INV-AGG：aggregateSegmentedStream 属性测试（守恒/定序/取消传播/段短读硬错/206-200 混发）----
+// 段 fetcher 形态：segFetch(i) 返回 { status, stream }——聚合器对每段调一次，拿到 206 响应体流。
+function buildAggHarness(segments, opts = {}) {
+  let calls = 0;
+  const callLog = [];
+  const segFetch = async (i, signal) => {
+    calls++;
+    callLog.push({ index: i, aborted: !!(signal && signal.aborted) });
+    const seg = segments[i];
+    if (!seg) throw new Error("no segment " + i);
+    if (seg.fail && (opts.failUntil === undefined || calls <= opts.failUntil)) throw new Error("headers-phase failure");
+    if (seg.status && seg.status !== 206) {
+      return { status: seg.status, headers: seg.headers || {}, stream: seg.stream || null };
+    }
+    return { status: 206, headers: { "content-range": "bytes " + seg.start + "-" + seg.end + "/" + opts.total }, stream: sourceOf(seg.chunks) };
+  };
+  return { segFetch, callLog, callsRef: { get n() { return calls; } } };
+}
+function segBody(bytes, start, end) {
+  return { start, end, chunks: [bytes] };
+}
+
+test("D-1 INV-AGG aggregateSegmentedStream: strict-order conservation across randomized segment counts", async () => {
+  const rng = mulberry32(0xD1D1D1D1);
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  for (let round = 0; round < 32; round++) {
+    const segCount = 2 + Math.floor(rng() * 5);
+    const segLen = 1 + Math.floor(rng() * 300);
+    const bytes = [];
+    for (let k = 0; k < segCount * segLen; k++) bytes.push((k * 97 + round * 31) & 0xff);
+    const segments = [];
+    for (let i = 0; i < segCount; i++) {
+      segments.push(segBody(bytes.slice(i * segLen, (i + 1) * segLen), i * segLen, (i + 1) * segLen - 1));
+    }
+    const h = buildAggHarness(segments, { total: segCount * segLen });
+    const out = await collectSlices(agg(h.segFetch, segCount));
+    const flat = [].concat(...out.map((a) => Array.from(a)));
+    assert.deepEqual(flat, bytes, "INV-AGG conservation round " + round);
+    assert.equal(h.callLog.length, segCount, "each segment fetched exactly once, round " + round);
+    for (let i = 0; i < segCount; i++) assert.equal(h.callLog[i].index, i, "call order is index order, round " + round);
+  }
+});
+
+test("D-1 INV-AGG aggregateSegmentedStream: downstream cancel cancels every in-flight segment reader", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const cancelled = new Set();
+  const launched = [];
+  const segFetch = async (i) => {
+    launched.push(i);
+    return {
+      status: 206,
+      headers: { "content-range": "bytes " + i * 4 + "-" + (i * 4 + 3) + "/12" },
+      stream: new ReadableStream({
+        start(c) { c.enqueue(new Uint8Array([i])); },
+        cancel() { cancelled.add(i); },
+      }),
+    };
+  };
+  const out = agg(segFetch, 3);
+  const reader = out.getReader();
+  const first = await reader.read();
+  assert.ok(!first.done, "first segment data flows");
+  await new Promise((r) => setTimeout(r, 20));
+  await reader.cancel();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(launched.length >= 2, "window launched at least 2 segments, got " + launched.length);
+  for (const i of launched) {
+    assert.ok(cancelled.has(i), "every launched segment reader must be cancelled on downstream cancel, segment " + i + " not cancelled");
+  }
+});
+
+test("D-1 INV-AGG aggregateSegmentedStream: headers-phase failure retries up to 2, then hard-errors the whole stream", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const perSegment = new Map();
+  const segFetch = async (i) => {
+    perSegment.set(i, (perSegment.get(i) || 0) + 1);
+    // production shape: the handler's segFetch swallows fetch throw/timeout into {status: 0}
+    return { status: 0, stream: null };
+  };
+  await assert.rejects(
+    () => collectSlices(agg(segFetch, 2)),
+    /status 0/,
+    "a segment whose headers never arrive must hard-error after retries are exhausted"
+  );
+  assert.equal(perSegment.size, 2, "both launched segments attempted");
+  for (const [i, n] of perSegment) {
+    assert.equal(n, 3, "segment " + i + " attempts exactly 3 (1 initial + 2 retries) even for network-phase status-0");
+  }
+});
+
+test("D-1 INV-AGG aggregateSegmentedStream: a non-206 segment status is terminal — the whole stream errors, never mixes bodies", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const segments = [
+    segBody([1, 2, 3, 4], 0, 3),
+    { status: 200, headers: { "content-length": "4" }, stream: sourceOf([[5, 6, 7, 8]]) },
+  ];
+  const segFetch = async (i) => {
+    const seg = segments[i];
+    if (seg.status === 206) return { status: 206, headers: {}, stream: sourceOf(seg.chunks) };
+    return { status: seg.status, headers: seg.headers, stream: seg.stream };
+  };
+  await assert.rejects(
+    () => collectSlices(agg(segFetch, 2)),
+    /200|206|segment/,
+    "a 200 mid-sequence must hard-error the aggregate (no silent byte mixing)"
+  );
+});
+
+test("D-1 INV-AGG aggregateSegmentedStream: a body that ends short hard-errors, never silently closes (sliceReadableStream parity)", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const segFetch = async (i) => {
+    if (i === 1) return { status: 206, headers: { "content-range": "bytes 104-107/500" }, stream: sourceOf([[1]]) }; // declares 4, delivers 1 then done
+    return { status: 206, headers: { "content-range": "bytes 100-103/500" }, stream: sourceOf([[9, 9, 9, 9]]) };
+  };
+  await assert.rejects(
+    () => collectSlices(agg(segFetch, [4, 4])),
+    /ended after 1 of 4/,
+    "a short segment body must hard-error like sliceReadableStream does"
+  );
+});
+
+test("D-1 INV-AGG merge-grain: a single segment fed many sub-merge chunks yields coalesced chunks, byte-identical, none split mid-byte", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const tiny = [];
+  for (let i = 0; i < 200; i++) tiny.push([i % 251]);
+  const segFetch = async () => ({ status: 206, headers: { "content-range": "bytes 0-199/200" }, stream: sourceOf(tiny.map((t) => new Uint8Array(t))) });
+  const pieces = await collectSlices(agg(segFetch, [200], { concurrency: 1, mergeBytes: 8192 }));
+  const joined = new Uint8Array(pieces.reduce((n, p) => n + p.byteLength, 0));
+  let off = 0; for (const p of pieces) { joined.set(p, off); off += p.byteLength; }
+  assert.equal(off, 200, "all 200 bytes must arrive, none swallowed at tail");
+  assert.ok(pieces.every((p) => p.byteLength > 0), "no zero-length chunk may be enqueued");
+  assert.equal(joined.length, 200, "byte count preserved");
+});
+
+test("D-1 knob parseSegmentMergeBytes: total-function clamp (fallback/min/max, zero NaN leak)", () => {
+  const parse = evalHandle(extractFnSource("parseSegmentMergeBytes"));
+  assert.equal(parse(undefined), 32768, "missing env -> 32 KiB fallback");
+  assert.equal(parse("0"), 32768, "zero -> fallback");
+  assert.equal(parse(-5), 32768, "negative -> fallback");
+  assert.equal(parse("abc"), 32768, "non-numeric -> fallback");
+  assert.equal(parse("1"), 8192, "below MIN clamps to 8 KiB");
+  assert.equal(parse("99999999"), 1048576, "above MAX clamps to 1 MiB");
+  assert.equal(parse("65536"), 65536, "in-range passes through");
+});
+
+test("D-1 INV-AGG merge-grain: chunk count is bounded by ceil(bytes/mergeBytes), proving coalescing actually engaged", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const tiny = []; for (let i = 0; i < 500; i++) tiny.push(new Uint8Array([i % 251]));
+  const segFetch = async () => ({ status: 206, headers: { "content-range": "bytes 0-499/500" }, stream: sourceOf(tiny) });
+  const pieces = await collectSlices(agg(segFetch, [500], { concurrency: 1, mergeBytes: 8192 }));
+  assert.ok(pieces.length <= Math.ceil(500 / 8192) + 1, "must coalesce; got " + pieces.length + " chunks for 500 bytes @ mergeBytes 8192");
+  assert.ok(pieces.length < 500, "coalescing must reduce chunk count below one-per-byte");
+});
+
+test("D-1 INV-AGG merge-grain stall window: a silent upstream must flush its coalesced bytes and hard-error the short segment, never hang or silently close", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const segFetch = async () => ({
+    status: 206,
+    headers: { "content-range": "bytes 0-3/100" },
+    stream: new ReadableStream({
+      start(c) {
+        c.enqueue(new Uint8Array([1, 2, 3, 4]));
+      },
+      cancel() {},
+    }),
+  });
+  const t0 = Date.now();
+  await assert.rejects(
+    () => collectSlices(agg(segFetch, [100], { concurrency: 1, mergeBytes: 8192 })),
+    /stalled after 4 of 100/,
+    "a segment that goes permanently silent short of its declared length must hard-error like a short body does (sliceReadableStream parity), not silently close"
+  );
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 3000, "a permanently silent upstream must terminate the stream, not hang forever, took " + elapsed + "ms");
+});
+
+test("F2b gate total-function: probeContentRangeOk accepts exact spans (incl. star total and case-insensitive unit) and never throws on junk", () => {
+  const ok = evalHandle(extractFnSource("probeContentRangeOk"));
+  assert.equal(ok("bytes 65536-131071/400000", 65536, 131071), true, "exact requested span");
+  assert.equal(ok("bytes 0-65535/400000", 65536, 131071), false, "misreported start rejected");
+  assert.equal(ok("bytes 65536-99999/400000", 65536, 131071), false, "misreported end rejected");
+  assert.equal(ok("bytes 65536-131071/*", 65536, 131071), true, "star total judged by the span alone");
+  assert.equal(ok("BYTES 65536-131071/400000", 65536, 131071), true, "unit token case-insensitive");
+  assert.equal(ok(null, 65536, 131071), false, "missing header false, never a throw");
+  assert.equal(ok(undefined, 0, 0), false, "undefined header false");
+  assert.equal(ok("", 0, 0), false, "empty header false");
+  assert.equal(ok("bytes abc-def/400000", 0, 0), false, "unparseable false");
+  assert.equal(ok(123, 0, 0), false, "non-string false");
+});
+
+test("F3 STALL window: a live source trickling every 220ms must complete byte-exact, never be killed by idle cycles", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const payload = []; for (let k = 0; k < 6; k++) payload.push(new Uint8Array([k + 1, k + 1]));
+  let issued = 0;
+  let sourceStopped = false;
+  const segFetch = async () => ({
+    status: 206,
+    headers: { "content-range": "bytes 0-11/12" },
+    stream: new ReadableStream({
+      start(c) {
+        const tick = () => {
+          if (sourceStopped) return;
+          if (issued < payload.length) { c.enqueue(payload[issued++]); setTimeout(tick, 220); }
+          else c.close();
+        };
+        tick();
+      },
+      cancel() { sourceStopped = true; },
+    }),
+  });
+  const pieces = await collectSlices(agg(segFetch, [12], { concurrency: 1, mergeBytes: 8192 }));
+  let off = 0; const joined = new Uint8Array(12);
+  for (const p of pieces) { assert.ok(p.byteLength > 0, "no zero-length chunk"); joined.set(p, off); off += p.byteLength; }
+  assert.equal(off, 12, "a 220ms-gap live source must deliver all 12 bytes");
+  for (let k = 0; k < 6; k++) { assert.equal(joined[k * 2], k + 1, "byte order preserved at " + k * 2); assert.equal(joined[k * 2 + 1], k + 1); }
+});
+
+test("F3 STALL lower-bound: a single ~900ms inter-chunk silence must survive, bracketing the deadline so it can never be shrunk to a hair-trigger", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const chunks = [new Uint8Array([7, 7]), new Uint8Array([9, 9])];
+  let issued = 0;
+  const segFetch = async () => ({
+    status: 206,
+    headers: { "content-range": "bytes 0-3/4" },
+    stream: new ReadableStream({
+      start(c) {
+        c.enqueue(chunks[issued++]);
+        setTimeout(() => { c.enqueue(chunks[issued++]); c.close(); }, 900);
+      },
+    }),
+  });
+  const pieces = await collectSlices(agg(segFetch, [4], { concurrency: 1, mergeBytes: 8192 }));
+  let off = 0; for (const p of pieces) off += p.byteLength;
+  assert.equal(off, 4, "a live source with one 900ms pause must still deliver all 4 bytes (deadline must be well above 900ms)");
 });

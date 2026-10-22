@@ -10,8 +10,8 @@ function compactTemplate(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-const GOLDEN_SHA256 = "a496f86595331590205f321c0c85dadcc04ff3f49d64d87be0c2f856ff8e85d3";
-const GOLDEN_LENGTH = 109339;
+const GOLDEN_SHA256 = "fcb6071fd996e9e88e01cb8daa14837f12a6f25faa3cac3710a17f763d32d4fd";
+const GOLDEN_LENGTH = 121539;
 
 test("Tier-3 renderHTML snapshot: golden length & sha256 master", () => {
   const html = renderHTML();
@@ -95,7 +95,31 @@ test("Tier-3 share head lock: anchor present, og tags injected not hardcoded", (
   const html = renderHTML();
   assert.ok(html.includes("<!--SHARE_HEAD-->"), "share head anchor must exist in the template");
   assert.ok(!html.includes("og:image"), "og tags must be injected per request, never hardcoded");
-  assert.ok(html.includes('<audio id="audio" preload="metadata"></audio>'), "audio element must carry preload=metadata");
+  assert.ok(html.includes('<audio id="audio" preload="auto"></audio>'), "audio element must carry preload=auto (buffer-ahead for slow overseas WebDAV origins)");
+});
+
+test("Tier-3 buffered-ranges lock: progress-buffered layer, renderer and progress wiring exist", () => {
+  const html = renderHTML();
+  assert.ok(html.includes('id="progress-buffered"'), "buffered layer div must exist inside progress-bar");
+  assert.ok(html.includes("function renderBufferedRanges()"), "buffered renderer must exist");
+  assert.ok(html.includes("audio.onprogress = renderBufferedRanges;"), "buffered renderer must be wired to onprogress");
+  assert.ok(html.includes(".progress-buffered { position: absolute;"), "buffered layer CSS must exist");
+  assert.ok(html.includes("renderBufferedRanges();"), "timeupdate must refresh the buffered layer");
+});
+
+test("Tier-3 source ordering lock: drag handle, state machine and CSS exist", () => {
+  const html = renderHTML();
+  assert.ok(html.includes("function beginDrag(e) {"), "drag state machine entry must be defined");
+  assert.ok(html.includes("function resolveDropIndex(e) {"), "drop index resolver must be defined");
+  assert.ok(html.includes("function finishDrag(e) {"), "drag finalizer must be defined");
+  assert.ok(html.includes('class="drag-handle"'), "drag handle styling hook must exist");
+  assert.ok(html.includes(".source-card.dragging { opacity: 0.45; }"), "dragging translucency CSS must exist");
+  assert.ok(html.includes(".drag-indicator-line { height: 2px;"), "drop indicator CSS must exist");
+  assert.ok(html.includes(".drag-handle { background: none; border: none; color: var(--sub); cursor: grab; padding: 4px; border-radius: 4px; display: flex; align-items: center; touch-action: none; -webkit-tap-highlight-color: transparent; }"), "touch-action: none is scoped to the handle only");
+  assert.ok(html.includes('id="icon-drag-indicator"'), "drag indicator sprite must exist");
+  assert.ok(!html.includes('class="move-btn"'), "move buttons must be removed (DEC-9: no coexistence)");
+  assert.ok(!html.includes("function moveCard(btnEl, dir) {"), "the old mover must be gone");
+  assert.ok(!html.includes('id="icon-chevron-up"'), "no chevron-up sprite may appear (legacy contract kept)");
 });
 
 test("Tier-3 playback resilience lock: heartbeat watchdog, resume and tag cache wired", () => {
@@ -209,4 +233,17 @@ test("Tier-3 tag-read lock: jsmediatags reads by URL (Range-savvy partial fetche
   assert.ok(!html.includes("res.blob()"), "the whole-file Blob materialization must be gone");
   assert.ok(!html.includes("'Range': 'bytes=0-524288'"), "the fixed head-only 512 KB Range cap must stay gone (the library negotiates its own ranges)");
   assert.ok(html.includes("tagAbort.signal.addEventListener('abort', cancelTagRead)"), "cancellation wiring: the abort signal must settle the read and best-effort abort the library reader (feature-detected)");
+});
+
+test("Tier-3 drag handle lock: icon-drag-indicator equals the official Material Symbols (MD3) code, not the stopped legacy npm glyph", () => {
+  const html = renderHTML();
+  const m = /<symbol id="icon-drag-indicator" viewBox="([^"]*)"><path d="([^"]+)"\/><\/symbol>/.exec(html);
+  assert.ok(m, "drag-indicator symbol with a single path must exist");
+  // 官方 Material Symbols drag_indicator（outlined 与 rounded 此 glyph 字节一致）取自
+  // fonts.gstatic.com/s/i/short-term/release/materialsymbols{outlined,rounded}/drag_indicator/default/24px.svg
+  assert.equal(m[1], "0 -960 960 960", "MD3 Material Symbols glyph must carry the 960 grid viewBox");
+  const OFFICIAL_M3 = "M360-160q-33 0-56.5-23.5T280-240q0-33 23.5-56.5T360-320q33 0 56.5 23.5T440-240q0 33-23.5 56.5T360-160Zm240 0q-33 0-56.5-23.5T520-240q0-33 23.5-56.5T600-320q33 0 56.5 23.5T680-240q0 33-23.5 56.5T600-160ZM360-400q-33 0-56.5-23.5T280-480q0-33 23.5-56.5T360-560q33 0 56.5 23.5T440-480q0 33-23.5 56.5T360-400Zm240 0q-33 0-56.5-23.5T520-480q0-33 23.5-56.5T600-560q33 0 56.5 23.5T680-480q0 33-23.5 56.5T600-400ZM360-640q-33 0-56.5-23.5T280-720q0-33 23.5-56.5T360-800q33 0 56.5 23.5T440-720q0 33-23.5 56.5T360-640Zm240 0q-33 0-56.5-23.5T520-720q0-33 23.5-56.5T600-800q33 0 56.5 23.5T680-720q0 33-23.5 56.5T600-640Z";
+  const BROKEN_SCATTER = "M11 18c0 1.1-.9 2-2 2s-2-.9-2-2 .9-2 2-2 2 .9 2 2zm-2-8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 4c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0-6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm6 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z";
+  assert.equal(m[2], OFFICIAL_M3, "the six-dot handle must be byte-equal to the official MD3 code");
+  assert.notEqual(m[2], BROKEN_SCATTER, "the pre-fix 3+2+1 scatter glyph must never reappear");
 });

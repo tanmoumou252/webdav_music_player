@@ -77,6 +77,7 @@ const HANDLES = [
   "resolveWebDavUrl",
   "fetchWebDavList",
   "parseSingleByteRange",
+  "parseUpstreamTimeoutMs",
   "audioContentTypeFor",
   "parseContentRangeTotal",
   "sliceReadableStream",

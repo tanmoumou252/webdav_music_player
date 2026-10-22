@@ -123,11 +123,78 @@ function parseContentRangeTotal(value) {
   return Number.isFinite(total) && total >= 0 ? total : null;
 }
 
+function parseUpstreamTimeoutMs(raw) {
+  const FALLBACK = 8000;
+  const MIN = 500;
+  const MAX = 300000;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentConcurrency(raw) {
+  const FALLBACK = 3;
+  const MIN = 1;
+  const MAX = 8;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentPartSize(raw) {
+  const FALLBACK = 1048576;
+  const MIN = 65536;
+  const MAX = 8388608;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentMaxSegments(raw) {
+  const FALLBACK = 16;
+  const MIN = 1;
+  const MAX = 64;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentMergeBytes(raw) {
+  const FALLBACK = 32768;
+  const MIN = 8192;
+  const MAX = 1048576;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function probeContentRangeOk(rawHeader, wantStart, wantEnd) {
+  if (typeof rawHeader !== "string") return false;
+  const m = /^bytes\s+(\d+)-(\d+)\/(?:\d+|\*)$/i.exec(rawHeader.trim());
+  if (!m) return false;
+  const s = parseInt(m[1], 10);
+  const e = parseInt(m[2], 10);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return false;
+  return s === wantStart && e === wantEnd;
+}
+
 function sliceReadableStream(stream, start, count) {
   if (!stream || !(count > 0)) return null;
   const reader = stream.getReader();
   let skipped = 0;
   let sent = 0;
+  const FLUSH_BYTES = 32768;
+  let pending = null;
   return new ReadableStream({
     async pull(controller) {
       try {
@@ -155,6 +222,30 @@ function sliceReadableStream(stream, start, count) {
             value = value.subarray(0, count - sent);
           }
           sent += value.byteLength;
+          if (pending && pending.byteLength + value.byteLength <= FLUSH_BYTES) {
+            const merged = new Uint8Array(pending.byteLength + value.byteLength);
+            merged.set(pending, 0);
+            merged.set(value, pending.byteLength);
+            pending = merged;
+            if (sent < count) continue;
+            controller.enqueue(pending);
+            pending = null;
+            controller.close();
+            reader.cancel().catch(() => {});
+            return;
+          }
+          if (pending) {
+            controller.enqueue(pending);
+            pending = null;
+            if (value.byteLength < FLUSH_BYTES && sent < count) {
+              pending = value;
+              return;
+            }
+          }
+          if (value.byteLength < FLUSH_BYTES && sent < count) {
+            pending = value;
+            continue;
+          }
           controller.enqueue(value);
           if (sent >= count) {
             controller.close();
@@ -173,7 +264,225 @@ function sliceReadableStream(stream, start, count) {
   });
 }
 
-async function fetchWebDavList(src) {
+function aggregateSegmentedStream(segFetch, segments, options) {
+  if (typeof segFetch !== "function") return null;
+  if (typeof segments === "number") segments = new Array(segments).fill(null);
+  if (!Array.isArray(segments) || segments.length === 0) return null;
+  const opts = options || {};
+  const concurrency = opts.concurrency > 0 ? opts.concurrency : 3;
+  const mergeBytes = opts.mergeBytes > 0 ? opts.mergeBytes : 32768;
+  const MERGE_STALL_MS = 40;
+  const STALL_DEADLINE_MS = 1500;
+  const STALL = Symbol("stall");
+  let failed = null;
+  let cancelRequested = false;
+  const readers = new Map();
+  const queues = new Map();
+  const pendingSeg = new Map();
+  const inFlight = new Set();
+  let wake = null;
+  let consumeIndex = 0;
+  const notify = () => { if (wake) { const w = wake; wake = null; w(); } };
+
+  function fail(e) {
+    if (failed) return;
+    failed = e;
+    for (const r of readers.values()) { try { r.cancel(); } catch (cErr) {} }
+    readers.clear();
+    for (const q of queues.values()) q.length = 0;
+    queues.clear();
+    pendingSeg.clear();
+    notify();
+  }
+
+  async function pump(i, reader) {
+    try {
+      let got = 0;
+      let pendingRead = reader.read();
+      let lastProgressAt = Date.now();
+      for (;;) {
+        if (cancelRequested || failed) return;
+        let stallTimer = null;
+        const raced = await Promise.race([pendingRead, new Promise((resolve) => { stallTimer = setTimeout(() => resolve(STALL), MERGE_STALL_MS); })]);
+        if (raced === STALL) {
+          const pend = pendingSeg.get(i);
+          if (!pend || pend.byteLength === 0) {
+            if (Date.now() - lastProgressAt < STALL_DEADLINE_MS) continue;
+            const declaredIdle = typeof segments[i] === "number" ? segments[i] : null;
+            if (declaredIdle !== null && got < declaredIdle) {
+              fail(new Error("upstream body stalled after " + got + " of " + declaredIdle + " bytes in segment " + i));
+              return;
+            }
+            const qi = queues.get(i) || [];
+            qi.push({ done: true });
+            queues.set(i, qi);
+            try { await reader.cancel(); } catch (cErr) {}
+            notify();
+            return;
+          }
+          const qs = queues.get(i) || [];
+          qs.push({ value: pend });
+          pendingSeg.delete(i);
+          queues.set(i, qs);
+          notify();
+          continue;
+        }
+        if (stallTimer) clearTimeout(stallTimer);
+        lastProgressAt = Date.now();
+        const chunk = raced;
+        if (chunk.done) {
+          const declared = typeof segments[i] === "number" ? segments[i] : null;
+          if (declared !== null && got < declared) {
+            fail(new Error("upstream body ended after " + got + " of " + declared + " bytes in segment " + i));
+            return;
+          }
+          const q = queues.get(i) || [];
+          const pendDone = pendingSeg.get(i);
+          if (pendDone) { q.push({ value: pendDone }); pendingSeg.delete(i); }
+          q.push({ done: true });
+          queues.set(i, q);
+          notify();
+          return;
+        }
+        got += chunk.value.byteLength;
+        const declared = typeof segments[i] === "number" ? segments[i] : null;
+        let value = chunk.value;
+        if (declared !== null && got > declared) {
+          value = value.subarray(0, value.byteLength - (got - declared));
+        }
+        const q = queues.get(i) || [];
+        if (value.byteLength > 0) {
+          const pend = pendingSeg.get(i);
+          if (pend && pend.byteLength + value.byteLength <= mergeBytes) {
+            const merged = new Uint8Array(pend.byteLength + value.byteLength);
+            merged.set(pend, 0);
+            merged.set(value, pend.byteLength);
+            pendingSeg.set(i, merged);
+          } else {
+            if (pend) { q.push({ value: pend }); pendingSeg.delete(i); }
+            if (value.byteLength < mergeBytes && (declared === null || got < declared)) pendingSeg.set(i, value);
+            else q.push({ value });
+          }
+        }
+        queues.set(i, q);
+        notify();
+        if (declared !== null && got >= declared) {
+          const q2 = queues.get(i);
+          const pendFull = pendingSeg.get(i);
+          if (pendFull) { q2.push({ value: pendFull }); pendingSeg.delete(i); }
+          q2.push({ done: true });
+          try { await reader.cancel(); } catch (cErr) {}
+          notify();
+          return;
+        }
+        pendingRead = reader.read();
+      }
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function launch(i) {
+    inFlight.add(i);
+    try {
+      for (let attempt = 0; ; attempt++) {
+        if (cancelRequested || failed) return;
+        let res = null;
+        try {
+          res = await segFetch(i);
+        } catch (fetchErr) {
+          if (attempt >= 2 || cancelRequested || failed) {
+            fail(fetchErr);
+            return;
+          }
+          continue;
+        }
+        if (res && res.status === 206 && res.stream) {
+          const reader = res.stream.getReader();
+          readers.set(i, reader);
+          await pump(i, reader);
+          if (failed || cancelRequested) {
+            try { await reader.cancel(); } catch (cErr) {}
+          }
+          return;
+        }
+        const retryable = res && (res.status === 0 || res.status === 429 || res.status >= 500);
+        if (!retryable || attempt >= 2 || cancelRequested || failed) {
+          fail(new Error("segment " + i + " headers-phase failure with status " + (res ? res.status : "no-response") + (retryable ? " (retries exhausted)" : " (terminal, no retry)")));
+          return;
+        }
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      inFlight.delete(i);
+      notify();
+    }
+  }
+
+  function requestMore(upTo) {
+    for (let i = nextLaunch; i < upTo && !failed && !cancelRequested; i++) {
+      if (!readers.has(i) && !inFlight.has(i)) {
+        nextLaunch = i + 1;
+        launch(i);
+      }
+    }
+  }
+
+  let nextLaunch = 0;
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        for (;;) {
+          if (failed) throw failed;
+          for (let i = consumeIndex; i < segments.length; i++) {
+            requestMore(Math.min(i + concurrency, segments.length));
+            const q = queues.get(i);
+            if (q && q.length) {
+              const item = q.shift();
+              if (item.done) {
+                queues.delete(i);
+                readers.delete(i);
+                consumeIndex = i + 1;
+                continue;
+              }
+              controller.enqueue(item.value);
+              return;
+            }
+            if (readers.has(i) || inFlight.has(i)) {
+              await new Promise((resolve) => { wake = resolve; });
+              break;
+            }
+            if (failed) throw failed;
+          }
+          if (failed) throw failed;
+          let anyPending = false;
+          for (let i = consumeIndex; i < segments.length; i++) {
+            if (queues.has(i) || readers.has(i) || inFlight.has(i)) { anyPending = true; break; }
+          }
+          if (!anyPending) {
+            controller.close();
+            return;
+          }
+        }
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      cancelRequested = true;
+      for (const r of readers.values()) { try { r.cancel(reason); } catch (cErr) {} }
+      readers.clear();
+      for (const q of queues.values()) q.length = 0;
+      queues.clear();
+      pendingSeg.clear();
+      notify();
+    }
+  });
+}
+
+async function fetchWebDavList(src, env) {
   let targetUrl = src.url.endsWith("/") ? src.url : src.url + "/";
 
   const headers = new Headers({ "Depth": "1" });
@@ -182,8 +491,15 @@ async function fetchWebDavList(src) {
   }
 
   let davRes;
+  const listTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+  const listAbort = new AbortController();
+  const listTimer = setTimeout(() => listAbort.abort(), listTimeoutMs);
   try {
-    davRes = await fetch(targetUrl, { method: "PROPFIND", headers });
+    try {
+      davRes = await fetch(targetUrl, { method: "PROPFIND", headers, signal: listAbort.signal });
+    } finally {
+      clearTimeout(listTimer);
+    }
   } catch (e) {
     const diag = generateDiagnostic(0, e.message, targetUrl, "PROPFIND", src.name);
     return {

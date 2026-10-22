@@ -183,7 +183,9 @@ function renderHTML() {
     
     .timeline-wrap { display: flex; align-items: center; width: 100%; gap: 10px; font-size: 0.75rem; color: var(--sub); }
     .progress-bar { flex: 1 1 auto; width: 100%; height: 5px; background: var(--border); border-radius: 3px; position: relative; cursor: pointer; }
-    .progress-fill { height: 100%; background: var(--accent); border-radius: 3px; width: 0%; pointer-events: none; }
+    .progress-buffered { position: absolute; top: 0; height: 100%; background: rgba(255, 255, 255, 0.25); border-radius: 3px; width: 0%; pointer-events: none; }
+    .progress-fill { position: relative; height: 100%; background: var(--accent); border-radius: 3px; width: 0%; pointer-events: none; }
+    .progress-bar.is-seeking { opacity: 0.5; }
 
     .source-card { border: 1px solid var(--border); border-radius: var(--radius-card); margin-bottom: 10px; background: var(--card); overflow: hidden; box-shadow: var(--shadow-card); }
     .source-card-header { padding: 10px 14px; background: var(--card-subtle); display: flex; align-items: center; justify-content: space-between; cursor: pointer; -webkit-user-select: none; user-select: none; }
@@ -204,6 +206,11 @@ function renderHTML() {
     .input-row input { width: 100%; background: var(--bg); border: 1px solid var(--border); padding: 8px 10px; border-radius: 6px; color: #fff; outline: none; }
     .del-btn { background: none; border: none; color: var(--danger); cursor: pointer; padding: 4px; border-radius: 4px; display: flex; align-items: center; }
     .del-btn:hover { background: var(--danger-bg-faint); }
+    .drag-handle { background: none; border: none; color: var(--sub); cursor: grab; padding: 4px; border-radius: 4px; display: flex; align-items: center; touch-action: none; -webkit-tap-highlight-color: transparent; }
+    .drag-handle:hover { color: var(--accent); background: var(--card-subtle); }
+    .drag-handle:active { cursor: grabbing; }
+    .source-card.dragging { opacity: 0.45; }
+    .drag-indicator-line { height: 2px; background: var(--accent); margin: -1px 0; border-radius: 1px; pointer-events: none; }
 
     #diag-modal .modal-box { width: min(580px, 92vw); }
     .diag-item { margin-bottom: 12px; font-size: 0.88rem; }
@@ -427,6 +434,7 @@ function renderHTML() {
     <symbol id="icon-volume-off" viewBox="0 0 24 24"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></symbol>
     <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></symbol>
     <symbol id="icon-queue-music" viewBox="0 0 24 24"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></symbol>
+    <symbol id="icon-drag-indicator" viewBox="0 -960 960 960"><path d="M360-160q-33 0-56.5-23.5T280-240q0-33 23.5-56.5T360-320q33 0 56.5 23.5T440-240q0 33-23.5 56.5T360-160Zm240 0q-33 0-56.5-23.5T520-240q0-33 23.5-56.5T600-320q33 0 56.5 23.5T680-240q0 33-23.5 56.5T600-160ZM360-400q-33 0-56.5-23.5T280-480q0-33 23.5-56.5T360-560q33 0 56.5 23.5T440-480q0 33-23.5 56.5T360-400Zm240 0q-33 0-56.5-23.5T520-480q0-33 23.5-56.5T600-560q33 0 56.5 23.5T680-480q0 33-23.5 56.5T600-400ZM360-640q-33 0-56.5-23.5T280-720q0-33 23.5-56.5T360-800q33 0 56.5 23.5T440-720q0 33-23.5 56.5T360-640Zm240 0q-33 0-56.5-23.5T520-720q0-33 23.5-56.5T600-800q33 0 56.5 23.5T680-720q0 33-23.5 56.5T600-640Z"/></symbol>
   </svg>
 
   <div id="sidebar-backdrop" onclick="closePlaylistDrawer()" aria-hidden="true"></div>
@@ -526,6 +534,7 @@ function renderHTML() {
         <div class="timeline-wrap">
           <span id="time-current">00:00</span>
           <div class="progress-bar" id="progress-bar" onclick="seekAudio(event)">
+            <div class="progress-buffered" id="progress-buffered"></div>
             <div class="progress-fill" id="progress-fill"></div>
           </div>
           <span id="time-duration">00:00</span>
@@ -565,7 +574,7 @@ function renderHTML() {
       </button>
     </div>
   </div>
-  <audio id="audio" preload="metadata"></audio>
+  <audio id="audio" preload="auto"></audio>
 
   <div class="modal" id="init-modal">
     <div class="modal-box">
@@ -811,6 +820,60 @@ function renderHTML() {
     const TAG_CACHE_MAX = 24;
     const PROGRESS_STORE_KEY = 'webdav_player_progress_v1';
     const PROGRESS_TTL_MS = 21600000;
+    const NODE_HEALTH_STORE_KEY = 'webdav_player_node_health_v1';
+    const NODE_HEALTH_TTL_MS = 86400000;
+    const NODE_HEALTH_MAX_ENTRIES = 64;
+
+    function readNodeHealth() {
+      try {
+        const raw = localStorage.getItem(NODE_HEALTH_STORE_KEY);
+        if (!raw) return {};
+        const rec = JSON.parse(raw);
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return {};
+        const now = Date.now();
+        const out = {};
+        let count = 0;
+        for (const k of Object.keys(rec)) {
+          const until = rec[k];
+          if (typeof until === 'number' && isFinite(until) && until > now && count < NODE_HEALTH_MAX_ENTRIES) {
+            out[k] = until;
+            count = count + 1;
+          }
+        }
+        return out;
+      } catch (e) {
+        return {};
+      }
+    }
+
+    function writeNodeHealth(map) {
+      try {
+        localStorage.setItem(NODE_HEALTH_STORE_KEY, JSON.stringify(map));
+      } catch (e) {}
+    }
+
+    function markNodeBad(sourceId) {
+      if (!sourceId) return;
+      const map = readNodeHealth();
+      map[String(sourceId)] = Date.now() + NODE_HEALTH_TTL_MS;
+      writeNodeHealth(map);
+    }
+
+    function clearNodeBad(sourceId) {
+      if (!sourceId) return;
+      const map = readNodeHealth();
+      if (Object.prototype.hasOwnProperty.call(map, String(sourceId))) {
+        delete map[String(sourceId)];
+        writeNodeHealth(map);
+      }
+    }
+
+    function isNodeAvoidable(sourceId) {
+      if (!sourceId) return false;
+      const map = readNodeHealth();
+      const until = map[String(sourceId)];
+      return typeof until === 'number' && until > Date.now();
+    }
 
     function escapeHtml(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -878,9 +941,26 @@ function renderHTML() {
       }
     }
 
-    document.addEventListener('keydown', (event) => {
+    const OVERLAY_MODAL_IDS = ['paste-modal', 'app-dialog', 'pass-modal', 'admin-modal', 'diag-modal', 'init-modal'];
+
+    function handleGlobalKeydown(event) {
+      if (event.key === ' ') {
+        if (event.repeat) return;
+        const ae = document.activeElement;
+        const tag = ae && ae.tagName ? ae.tagName : '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || tag === 'A' || (ae && ae.isContentEditable)) return;
+        for (let i = 0; i < OVERLAY_MODAL_IDS.length; i++) {
+          const m = document.getElementById(OVERLAY_MODAL_IDS[i]);
+          if (m && m.classList.contains('show')) return;
+        }
+        const vp = document.getElementById('volume-popover');
+        if (vp && vp.classList.contains('show')) return;
+        event.preventDefault();
+        togglePlay();
+        return;
+      }
       if (event.key !== 'Escape') return;
-      const modalOrder = ['paste-modal', 'app-dialog', 'pass-modal', 'admin-modal', 'diag-modal', 'init-modal'];
+      const modalOrder = OVERLAY_MODAL_IDS;
       for (let i = 0; i < modalOrder.length; i++) {
         const modal = document.getElementById(modalOrder[i]);
         if (modal && modal.classList.contains('show')) {
@@ -915,7 +995,8 @@ function renderHTML() {
       if (sidebar && sidebar.classList.contains('drawer-open')) {
         closePlaylistDrawer();
       }
-    });
+    }
+    document.addEventListener('keydown', handleGlobalKeydown);
 
     function formatTime(sec) {
       if (isNaN(sec)) return "00:00";
@@ -1413,17 +1494,33 @@ function renderHTML() {
         window.history.replaceState(null, '', u.toString());
       }
 
+      retrySkippedNodes = null;
+      retryBypassOnce = false;
+      playingFromRetryQueue = false;
       tryPlayFromNode(song, nodeIndex, isAuto);
     }
 
+    var retrySkippedNodes = null;
+    var retryBypassOnce = false;
+    var playingFromRetryQueue = false;
+
     async function tryPlayFromNode(song, nodeIndex, isAuto = false) {
       const token = ++playToken;
+
+      if (song && song.availableNodes && nodeIndex >= song.availableNodes.length && retrySkippedNodes && retrySkippedNodes.length > 0) {
+        const nextRetryIdx = retrySkippedNodes.shift();
+        retryBypassOnce = true;
+        playingFromRetryQueue = true;
+        tryPlayFromNode(song, nextRetryIdx, isAuto);
+        return;
+      }
 
       if (!song.availableNodes || nodeIndex >= song.availableNodes.length) {
         if (token !== playToken) return;
         stopStallHeartbeat();
         stallRetries = 0;
         pendingSeek = null;
+        playingFromRetryQueue = false;
         reportDiagnostic({
           title: "所有 WebDAV 线路均尝试失败",
           sourceName: "全局容灾",
@@ -1436,13 +1533,25 @@ function renderHTML() {
         return;
       }
 
-      const node = song.availableNodes[nodeIndex];
+      let effectiveIndex = nodeIndex;
+      const bypassThisHop = retryBypassOnce;
+      retryBypassOnce = false;
+      if (!bypassThisHop && effectiveIndex < song.availableNodes.length - 1 && isNodeAvoidable(song.availableNodes[effectiveIndex].sourceId)) {
+        let probe = effectiveIndex;
+        if (!retrySkippedNodes) retrySkippedNodes = [];
+        while (probe < song.availableNodes.length - 1 && isNodeAvoidable(song.availableNodes[probe].sourceId)) {
+          if (retrySkippedNodes.indexOf(probe) === -1) retrySkippedNodes.push(probe);
+          probe = probe + 1;
+        }
+        effectiveIndex = probe;
+      }
+      const node = song.availableNodes[effectiveIndex];
       const totalInQueue = currentPlaylist.length > 0 ? (' (' + (currentIndex + 1) + '/' + currentPlaylist.length + ')') : '';
-      document.getElementById('info-node').textContent = '线路: ' + (nodeIndex + 1) + '/' + song.availableNodes.length + totalInQueue;
+      document.getElementById('info-node').textContent = '线路: ' + (effectiveIndex + 1) + '/' + song.availableNodes.length + totalInQueue;
 
       const streamUrl = '/api/stream?sourceId=' + encodeURIComponent(node.sourceId) + '&file=' + encodeURIComponent(node.href);
 
-      currentNodeIndex = nodeIndex;
+      currentNodeIndex = effectiveIndex;
       currentIsAuto = isAuto;
       if (pendingSeek === null) pendingSeek = lastKnownProgress(song);
 
@@ -1474,9 +1583,10 @@ function renderHTML() {
           if (token !== playToken) return;
         }
         if (token !== playToken) return;
-        console.warn('节点 ' + (nodeIndex + 1) + ' 失败，尝试下一镜像...');
+        console.warn('节点 ' + (effectiveIndex + 1) + ' 失败，尝试下一镜像...');
+        markNodeBad(node.sourceId);
         pendingSeek = lastKnownProgress(song) || pendingSeek;
-        tryPlayFromNode(song, nodeIndex + 1, isAuto);
+        tryPlayFromNode(song, playingFromRetryQueue ? song.availableNodes.length : effectiveIndex + 1, isAuto);
       };
 
       const cachedTags = tagCache.get(songKey(song));
@@ -1502,6 +1612,8 @@ function renderHTML() {
           const restored = lastKnownProgress(currentSongRef);
           if (restored !== null) {
             pendingSeek = restored;
+            retrySkippedNodes = null;
+            playingFromRetryQueue = false;
             tryPlayFromNode(currentSongRef, currentNodeIndex, currentIsAuto);
             return;
           }
@@ -1572,12 +1684,50 @@ function renderHTML() {
       }
     };
 
+    function renderBufferedRanges() {
+      const el = document.getElementById('progress-buffered');
+      if (!el) return;
+      let left = 0;
+      let width = 0;
+      try {
+        if (audio.buffered && audio.buffered.length && audio.duration && isFinite(audio.duration) && audio.duration > 0) {
+          for (let i = 0; i < audio.buffered.length; i++) {
+            const s = audio.buffered.start(i);
+            const e2 = audio.buffered.end(i);
+            if (s <= audio.currentTime + 0.5 && e2 > audio.currentTime) {
+              left = (s / audio.duration) * 100;
+              width = ((e2 - s) / audio.duration) * 100;
+              break;
+            }
+          }
+          if (width === 0) {
+            const s = audio.buffered.start(0);
+            const e2 = audio.buffered.end(0);
+            left = (s / audio.duration) * 100;
+            width = ((e2 - s) / audio.duration) * 100;
+          }
+        }
+      } catch (rangeErr) { left = 0; width = 0; }
+      el.style.left = left + '%';
+      el.style.width = width + '%';
+    }
+
+    audio.onprogress = renderBufferedRanges;
+
+    audio.onseeked = () => {
+      const seekingBar = document.getElementById('progress-bar');
+      if (seekingBar) seekingBar.classList.remove('is-seeking');
+    };
+
     function seekAudio(e) {
       const bar = document.getElementById('progress-bar');
+      if (!bar || typeof bar.getBoundingClientRect !== 'function') return;
       const rect = bar.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
-      if (audio.duration) {
+      if (!rect || !rect.width) return;
+      const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      if (audio.duration && isFinite(audio.duration)) {
         audio.currentTime = pct * audio.duration;
+        bar.classList.add('is-seeking');
       }
     }
 
@@ -1597,6 +1747,7 @@ function renderHTML() {
         const pct = (audio.currentTime / audio.duration) * 100;
         document.getElementById('progress-fill').style.width = pct + '%';
       }
+      renderBufferedRanges();
 
       if (lrcData.length === 0) return;
 
@@ -1632,6 +1783,8 @@ function renderHTML() {
       pendingSeek = null;
       resetStallMarks();
       startStallHeartbeat();
+      const metaBar = document.getElementById('progress-bar');
+      if (metaBar) metaBar.classList.remove('is-seeking');
       if (pendingTag && pendingTag.token === playToken) {
         const job = pendingTag;
         pendingTag = null;
@@ -1781,15 +1934,20 @@ function renderHTML() {
         stallRetries = stallRetries + 1;
         console.warn('播放停滞，就地重连并回到上次进度（第 ' + stallRetries + ' 次）');
         showToast('网络抖动，正在恢复播放位置…');
-        pendingSeek = lastKnownProgress(song);
+        if (pendingSeek === null) {
+          const livePos = audio.currentTime;
+          pendingSeek = (isFinite(livePos) && livePos >= 3) ? livePos : lastKnownProgress(song);
+        }
         resetStallMarks();
         tryPlayFromNode(song, currentNodeIndex, currentIsAuto);
         return;
       }
       stallRetries = 0;
       console.warn('就地重连无效，切换下一镜像线路');
+      const abandoned = currentSongRef && currentSongRef.availableNodes ? currentSongRef.availableNodes[currentNodeIndex] : null;
+      if (abandoned) markNodeBad(abandoned.sourceId);
       resetStallMarks();
-      tryPlayFromNode(song, currentNodeIndex + 1, currentIsAuto);
+      tryPlayFromNode(song, playingFromRetryQueue ? song.availableNodes.length : currentNodeIndex + 1, currentIsAuto);
     }
 
     function normalizeTags(t) {
@@ -1916,8 +2074,12 @@ function renderHTML() {
     audio.onplaying = () => {
       waitingForGesture = false;
       externallyPaused = false;
+      const playingNode = currentSongRef && currentSongRef.availableNodes ? currentSongRef.availableNodes[currentNodeIndex] : null;
+      if (playingNode) clearNodeBad(playingNode.sourceId);
       resetStallMarks();
       startStallHeartbeat();
+      const playingBar = document.getElementById('progress-bar');
+      if (playingBar) playingBar.classList.remove('is-seeking');
     };
 
     audio.oncanplay = () => {
@@ -2013,22 +2175,36 @@ function renderHTML() {
       }
     }
 
+    let adminLoggingIn = false;
+
     async function loginAdmin() {
-      const pass = document.getElementById('login-admin-pass').value;
-      const res = await fetch('/api/admin/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminPass: pass })
-      });
-      if (res.ok) {
-        isAuthed = true;
-        showAdminContent();
-      } else {
-        let msg = '密码错误';
-        try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) {}
-        showAppDialog(msg);
+      if (adminLoggingIn) return;
+      adminLoggingIn = true;
+      try {
+        const pass = document.getElementById('login-admin-pass').value;
+        const res = await fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminPass: pass })
+        });
+        if (res.ok) {
+          isAuthed = true;
+          showAdminContent();
+        } else {
+          let msg = '密码错误';
+          try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) {}
+          showAppDialog(msg);
+        }
+      } finally {
+        adminLoggingIn = false;
       }
     }
+
+    function handleLoginKeydown(e) {
+      if (e.key === 'Enter') loginAdmin();
+    }
+
+    document.getElementById('login-admin-pass').addEventListener('keydown', handleLoginKeydown);
 
     async function showAdminContent() {
       document.getElementById('admin-login-sec').style.display = 'none';
@@ -2042,6 +2218,7 @@ function renderHTML() {
       const container = document.getElementById('sources-container');
       container.innerHTML = '';
       sources.forEach((s, idx) => container.appendChild(createSourceCard(s, idx, false)));
+      bindDragHandles();
     }
 
     function createSourceCard(s = {}, idx = Date.now(), isOpen = false) {
@@ -2057,6 +2234,9 @@ function renderHTML() {
             <span class="source-name-badge">\${escapeHtml(sourceName)}</span>
             <span class="source-url-preview">\${escapeHtml(sourceUrl)}</span>
           </div>
+          <button type="button" class="drag-handle" title="拖拽排序" aria-label="拖拽排序">
+            <svg class="md-icon md-icon-sm"><use href="#icon-drag-indicator"/></svg>
+          </button>
           <button class="del-btn" onclick="event.stopPropagation(); deleteCard(this)" title="删除源">
             <svg class="md-icon md-icon-sm"><use href="#icon-delete"/></svg>
           </button>
@@ -2080,6 +2260,119 @@ function renderHTML() {
     function deleteCard(btnEl) {
       btnEl.closest('.source-card').remove();
     }
+
+    var dragState = null;
+
+    function getDragCardFromEvent(e) {
+      var handle = e.target && e.target.closest ? e.target.closest('.drag-handle') : null;
+      if (!handle) return null;
+      return handle.closest('.source-card');
+    }
+
+    function beginDrag(e) {
+      if (dragState) return;
+      var card = getDragCardFromEvent(e);
+      if (!card) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var st = { pointerId: e.pointerId, card: card, started: false };
+      try {
+        e.target.setPointerCapture(e.pointerId);
+      } catch (err) {}
+      dragState = st;
+      window.addEventListener('pointermove', onDragMove);
+      window.addEventListener('pointerup', onDragEnd);
+      window.addEventListener('pointercancel', onDragCancel);
+    }
+
+    function resolveDropIndex(e) {
+      var container = document.getElementById('sources-container');
+      if (!container) return -1;
+      var cards = container.querySelectorAll('.source-card');
+      for (var i = 0; i < cards.length; i++) {
+        var r = cards[i].getBoundingClientRect();
+        if (e.clientY < r.top + r.height / 2) return i;
+      }
+      return cards.length;
+    }
+
+    function onDragMove(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      if (!dragState.started) {
+        dragState.started = true;
+        dragState.card.classList.add('dragging');
+      }
+      var container = document.getElementById('sources-container');
+      if (!container) return;
+      var idx = resolveDropIndex(e);
+      var line = container.querySelector('.drag-indicator-line');
+      if (idx < 0) {
+        if (line) line.remove();
+        return;
+      }
+      if (!line) {
+        line = document.createElement('div');
+        line.className = 'drag-indicator-line';
+      }
+      var cards = container.querySelectorAll('.source-card');
+      if (idx >= cards.length) {
+        container.appendChild(line);
+      } else {
+        container.insertBefore(line, cards[idx]);
+      }
+    }
+
+    function onDragEnd(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      finishDrag(e);
+    }
+
+    function onDragCancel(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      finishDrag(e);
+    }
+
+    function finishDrag(e) {
+      var st = dragState;
+      if (!st) return;
+      dragState = null;
+      window.removeEventListener('pointermove', onDragMove);
+      window.removeEventListener('pointerup', onDragEnd);
+      window.removeEventListener('pointercancel', onDragCancel);
+      st.card.classList.remove('dragging');
+      var container = document.getElementById('sources-container');
+      var line = container ? container.querySelector('.drag-indicator-line') : null;
+      if (line) line.remove();
+      if (!e || !st.started || !container) return;
+      var idx = resolveDropIndex(e);
+      if (idx < 0) return;
+      var cards = container.querySelectorAll('.source-card');
+      var from = Array.prototype.indexOf.call(cards, st.card);
+      if (from === -1) return;
+      var target = st.card;
+      if (idx >= cards.length) {
+        var last = cards[cards.length - 1];
+        if (last !== st.card) target = null;
+      } else {
+        target = cards[idx];
+      }
+      if (target === st.card) return;
+      if (idx >= cards.length) {
+        container.appendChild(st.card);
+      } else {
+        container.insertBefore(st.card, target);
+      }
+    }
+
+    function bindDragHandles() {
+      var container = document.getElementById('sources-container');
+      if (!container || container.dataset.dragBound === '1') return;
+      container.dataset.dragBound = '1';
+      container.addEventListener('pointerdown', beginDrag);
+    }
+
+    window.addEventListener('blur', () => { if (dragState) finishDrag(null); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden && dragState) finishDrag(null); });
 
     function updateCardTitle(inputEl) {
       const badge = inputEl.closest('.source-card').querySelector('.source-name-badge');

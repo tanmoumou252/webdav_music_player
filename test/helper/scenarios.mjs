@@ -770,6 +770,39 @@ export function scenarios() {
       post: async () => ({}),
     },
     {
+      name: "stream-multirange-forwarded",
+      seedKV: seedSources([F.SOURCE_A]),
+      request: { ...GET("/api/stream?sourceId=a&file=Alpha%20-%20One.mp3"), headers: { range: "bytes=0-1,5-6" } },
+      stub: route({
+        [F.SOURCE_A.url]: () =>
+          new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } }),
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "jsmediatags-kv-hit",
+      seedKV: { jsmediatags_3_9_5: F.jsmediatagsBody },
+      request: GET("/js/jsmediatags.min.js"),
+      stub: route({
+        "https://cdnjs.cloudflare.com/": () => {
+          throw new Error("CDN must not be called on a KV hit");
+        },
+      }),
+      post: async () => ({}),
+    },
+    {
+      name: "jsmediatags-kv-miss-backfill",
+      seedKV: {},
+      request: GET("/js/jsmediatags.min.js"),
+      stub: route({
+        "https://cdnjs.cloudflare.com/": () =>
+          new Response(F.jsmediatagsBody, { status: 200 }),
+      }),
+      post: async (env) => ({
+        kvBackfilled: (await env.MUSIC_KV.get("jsmediatags_3_9_5")) === F.jsmediatagsBody,
+      }),
+    },
+    {
       name: "list-all-writes-share-index",
       seedKV: seedSources([F.SOURCE_A, F.SOURCE_B], true),
       request: GET("/api/list", COOKIE),
