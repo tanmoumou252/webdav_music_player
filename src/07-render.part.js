@@ -1572,19 +1572,22 @@ function renderHTML() {
 
       audio.onerror = async () => {
         if (token !== playToken) return;
+        let originProbeFailed = false;
         try {
           const check = await fetch(streamUrl, { headers: { 'Range': 'bytes=0-65535' } });
           if (token !== playToken) return;
           if (!check.ok) {
+            originProbeFailed = true;
             const errJson = await check.json().catch(() => ({}));
             if (errJson.diagnostic) reportDiagnostic(errJson.diagnostic, { quiet: isAuto ? true : false });
           }
         } catch(e) {
           if (token !== playToken) return;
+          originProbeFailed = true;
         }
         if (token !== playToken) return;
         console.warn('节点 ' + (effectiveIndex + 1) + ' 失败，尝试下一镜像...');
-        markNodeBad(node.sourceId);
+        if (originProbeFailed) markNodeBad(node.sourceId);
         pendingSeek = lastKnownProgress(song) || pendingSeek;
         tryPlayFromNode(song, playingFromRetryQueue ? song.availableNodes.length : effectiveIndex + 1, isAuto);
       };

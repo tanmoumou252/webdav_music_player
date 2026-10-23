@@ -1054,3 +1054,39 @@ test("retry-queue advance: a failed last-resort line plays the next queued skip,
   for (let k = 0; k < 6; k++) await flushMicrotasks();
   assert.equal(T.getState().currentNodeIndex, 1, "retry-queue advance: a failing must play the next queued skip b (index 1), not re-scan onto a retried line");
 });
+
+test("G3 onerror marks only on a confirmed origin-probe failure: a media/decode error whose probe answered OK must advance the mirror WITHOUT blacklisting the source", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => "" });
+  const SONG_OK = { id: "g3ok0001", name: "Probe - Ok.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  await T.tryPlayFromNode(SONG_OK, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 0, "precondition: s1 (index 0) plays, nothing avoided");
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "a decode/media error still advances to the next mirror");
+  assert.equal(T.isNodeAvoidable("s1"), false, "a source whose probe answered OK must NOT be avoided for 24h over a decode error");
+  assert.equal(sandbox.localStorage.getItem("webdav_player_node_health_v1"), null, "no health bits may be written when the probe confirms the origin is alive");
+});
+
+test("G3 onerror still marks when the probe confirms a non-2xx origin failure (regression shield against over-fix)", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = async () => ({ ok: false, status: 503, json: async () => ({}), text: async () => "" });
+  const SONG_BAD = { id: "g3bad001", name: "Probe - Bad.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  await T.tryPlayFromNode(SONG_BAD, 0, false);
+  await flushMicrotasks();
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.isNodeAvoidable("s1"), true, "a probe that reports a non-2xx origin failure must still mark the node bad");
+});
+
+test("G3 onerror still marks when the probe fetch itself throws / network down (regression shield)", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = async () => { throw new Error("net-down"); };
+  const SONG_THROW = { id: "g3thr001", name: "Probe - Throw.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  await T.tryPlayFromNode(SONG_THROW, 0, false);
+  await flushMicrotasks();
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.isNodeAvoidable("s1"), true, "a probe that throws must be treated as an origin failure and mark the node bad");
+});

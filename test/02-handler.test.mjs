@@ -1007,3 +1007,87 @@ test("F2 probe content-range gate: a 206 whose span is not the requested one is 
     assert.ok(lyingProbeCancels >= 1, "the discarded lying probe body must be cancelled");
   } finally { globalThis.fetch = prevFetch; }
 });
+
+test("G1 fan-out cap gate: when the max-segments re-scale would push one segment past the 8 MiB PartSize ceiling, the fan-out is skipped and the client still gets the byte-exact range via the single-connection slice", async () => {
+  const env = STREAM_ENV();
+  env.STREAM_SEGMENT_PART_SIZE = "65536";
+  env.STREAM_SEGMENT_MAX_SEGMENTS = "1";
+  const prevFetch = globalThis.fetch;
+  const BIG_BODY = F.RANGE_BODY_500.repeat(16778);
+  const TOTAL = BIG_BODY.length;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(BIG_BODY, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(TOTAL) } });
+  };
+  try {
+    const start = 0, end = 8388608;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    assert.equal(res.status, 206, "the slice fallback still answers 206");
+    assert.equal(res.headers.get("content-range"), "bytes " + start + "-" + end + "/" + TOTAL, "Content-Range must stay the client's original span");
+    assert.equal(res.headers.get("content-length"), String(end - start + 1));
+    const body = await res.text();
+    assert.equal(body, BIG_BODY.slice(start, end + 1), "single-connection slice must be byte-exact");
+    assert.equal(calls, 1, "no fan-out probe may be issued once the recomputed part size exceeds the 8 MiB cap, got " + calls + " upstream calls");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("G2 wiring: STREAM_FETCH_TIMEOUT_MS reaches the body-phase stall deadline through the handler into aggregateSegmentedStream", async () => {
+  const src01 = readFileSync(join(fileURLToPath(new URL(".", import.meta.url)), "..", "src", "01-handler.part.js"), "utf8");
+  assert.match(src01, /stallDeadlineMs:\s*upstreamTimeoutMs/, "structural lock: the handler must forward the resolved upstream timeout into the aggregator stall deadline");
+  const env = streamEnv("65536");
+  env.STREAM_FETCH_TIMEOUT_MS = "500";
+  const prevFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    calls++;
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (calls === 1) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    if (s === 0) return segSlice(s, e);
+    return new Response(new ReadableStream({
+      start(c) {},
+      cancel() {},
+    }), { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": "bytes " + s + "-" + e + "/" + RANGE_BODY_400K.length, "content-length": String(e - s + 1) } });
+  };
+  try {
+    const start = 0, end = 131071;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    assert.equal(res.status, 206, "fan-out begins");
+    const t0 = Date.now();
+    await assert.rejects(() => res.text(), /stalled after 0 of 65536 bytes in segment 0/, "the planned segment stalls; the deadline must be the wired 500ms");
+    const elapsed = Date.now() - t0;
+    assert.ok(calls >= 2, "precondition: fan-out must have issued the initial + segment requests, got " + calls);
+    assert.ok(elapsed < 1400, "STREAM_FETCH_TIMEOUT_MS=500 must set the body-phase stall deadline; the hardcoded 1500 starts its clock strictly after t0 (the segment pump only launches on the consumer's first pull), so the old build breaches 1400 deterministically, took " + elapsed + "ms");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("H1 probe backoff: a 429 first-segment probe must be retried after an exponential pause, never hammered immediately", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_RETRY_BASE_MS = "40";
+  const prevFetch = globalThis.fetch;
+  const stamps = [];
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    calls++;
+    stamps.push(Date.now());
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (calls === 1) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    if (calls === 2) return new Response("", { status: 429, statusText: "Too Many Requests", headers: { "content-length": "0" } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 0, end = 131071;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    assert.equal(res.status, 206, "fan-out must still answer 206 after a backed-off probe retry");
+    const body = await res.text();
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1), "bytes must stay byte-exact through the retry");
+    assert.equal(calls, 4, "exactly initial + 429 probe + backed-off honest probe + one planned segment, got " + calls);
+    const gap = stamps[2] - stamps[1];
+    assert.ok(gap >= 35, "the retry after a 429 probe must wait the configured 40ms backoff, observed gap " + gap + "ms");
+  } finally { globalThis.fetch = prevFetch; }
+});

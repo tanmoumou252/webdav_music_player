@@ -575,12 +575,13 @@ export default {
           let segPartSize = parseSegmentPartSize(env && env.STREAM_SEGMENT_PART_SIZE);
           const segMaxSegments = parseSegmentMaxSegments(env && env.STREAM_SEGMENT_MAX_SEGMENTS);
           const segMergeBytes = parseSegmentMergeBytes(env && env.STREAM_SEGMENT_MERGE_BYTES);
-          if (rangeCount > segPartSize) {
-            let segCount = Math.ceil(rangeCount / segPartSize);
-            if (segCount > segMaxSegments) {
-              segCount = segMaxSegments;
-              segPartSize = Math.ceil(rangeCount / segCount);
-            }
+          const segRetryBaseMs = parseSegmentRetryBaseMs(env && env.STREAM_SEGMENT_RETRY_BASE_MS);
+          let segCount = rangeCount > segPartSize ? Math.ceil(rangeCount / segPartSize) : 0;
+          if (segCount > segMaxSegments) {
+            segCount = segMaxSegments;
+            segPartSize = Math.ceil(rangeCount / segCount);
+          }
+          if (segCount > 0 && segPartSize <= SEGMENT_PART_SIZE_MAX) {
             const firstRangeStart = clientStart;
             const fanoutAbort = new AbortController();
             try {
@@ -615,11 +616,16 @@ export default {
                   if (!retryableProbe || fanoutAbort.signal.aborted) break;
                   try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
                   firstSegRes = null;
+                  if (probeAttempt === 2) break;
+                  await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                  if (fanoutAbort.signal.aborted) break;
                 }
               } catch (probeFetchErr) {
                 if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
                 if (probeAttempt === 2) break;
                 firstSegRes = null;
+                await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
               } finally {
                 clearTimeout(probeTimer);
               }
@@ -682,6 +688,8 @@ export default {
             const agg = aggregateSegmentedStream(segFetch, segments, {
               concurrency: segConcurrency,
               mergeBytes: segMergeBytes,
+              segmentRetryBaseMs: segRetryBaseMs,
+              stallDeadlineMs: upstreamTimeoutMs,
               signal: fanoutAbort.signal
             });
             if (!agg) {
@@ -1227,10 +1235,12 @@ function parseSegmentConcurrency(raw) {
   return n;
 }
 
+const SEGMENT_PART_SIZE_MAX = 8388608;
+
 function parseSegmentPartSize(raw) {
   const FALLBACK = 1048576;
   const MIN = 65536;
-  const MAX = 8388608;
+  const MAX = SEGMENT_PART_SIZE_MAX;
   const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
   if (!Number.isFinite(n) || n <= 0) return FALLBACK;
   if (n < MIN) return MIN;
@@ -1256,6 +1266,22 @@ function parseSegmentMergeBytes(raw) {
   const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
   if (!Number.isFinite(n) || n <= 0) return FALLBACK;
   if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+const SEGMENT_RETRY_BASE_MS = 250;
+
+function segmentRetryDelayMs(attempt, baseMs) {
+  const base = baseMs >= 0 ? baseMs : SEGMENT_RETRY_BASE_MS;
+  return base * Math.pow(2, attempt);
+}
+
+function parseSegmentRetryBaseMs(raw) {
+  const FALLBACK = SEGMENT_RETRY_BASE_MS;
+  const MAX = 10000;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n < 0) return FALLBACK;
   if (n > MAX) return MAX;
   return n;
 }
@@ -1353,8 +1379,10 @@ function aggregateSegmentedStream(segFetch, segments, options) {
   const opts = options || {};
   const concurrency = opts.concurrency > 0 ? opts.concurrency : 3;
   const mergeBytes = opts.mergeBytes > 0 ? opts.mergeBytes : 32768;
+  const retryBaseMs = typeof opts.segmentRetryBaseMs === "number" && opts.segmentRetryBaseMs >= 0 ? opts.segmentRetryBaseMs : SEGMENT_RETRY_BASE_MS;
+  const retrySleep = typeof opts.retrySleep === "function" ? opts.retrySleep : (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
   const MERGE_STALL_MS = 40;
-  const STALL_DEADLINE_MS = 1500;
+  const STALL_DEADLINE_MS = opts.stallDeadlineMs > 0 ? opts.stallDeadlineMs : parseUpstreamTimeoutMs(undefined);
   const STALL = Symbol("stall");
   let failed = null;
   let cancelRequested = false;
@@ -1477,6 +1505,8 @@ function aggregateSegmentedStream(segFetch, segments, options) {
             fail(fetchErr);
             return;
           }
+          await retrySleep(segmentRetryDelayMs(attempt, retryBaseMs));
+          if (cancelRequested || failed) return;
           continue;
         }
         if (res && res.status === 206 && res.stream) {
@@ -1493,6 +1523,9 @@ function aggregateSegmentedStream(segFetch, segments, options) {
           fail(new Error("segment " + i + " headers-phase failure with status " + (res ? res.status : "no-response") + (retryable ? " (retries exhausted)" : " (terminal, no retry)")));
           return;
         }
+        if (res && res.stream) { try { res.stream.cancel().catch(() => {}); } catch (cErr) {} }
+        await retrySleep(segmentRetryDelayMs(attempt, retryBaseMs));
+        if (cancelRequested || failed) return;
       }
     } catch (e) {
       fail(e);
@@ -3258,19 +3291,22 @@ function renderHTML() {
 
       audio.onerror = async () => {
         if (token !== playToken) return;
+        let originProbeFailed = false;
         try {
           const check = await fetch(streamUrl, { headers: { 'Range': 'bytes=0-65535' } });
           if (token !== playToken) return;
           if (!check.ok) {
+            originProbeFailed = true;
             const errJson = await check.json().catch(() => ({}));
             if (errJson.diagnostic) reportDiagnostic(errJson.diagnostic, { quiet: isAuto ? true : false });
           }
         } catch(e) {
           if (token !== playToken) return;
+          originProbeFailed = true;
         }
         if (token !== playToken) return;
         console.warn('节点 ' + (effectiveIndex + 1) + ' 失败，尝试下一镜像...');
-        markNodeBad(node.sourceId);
+        if (originProbeFailed) markNodeBad(node.sourceId);
         pendingSeek = lastKnownProgress(song) || pendingSeek;
         tryPlayFromNode(song, playingFromRetryQueue ? song.availableNodes.length : effectiveIndex + 1, isAuto);
       };

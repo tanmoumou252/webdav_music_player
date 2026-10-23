@@ -656,7 +656,14 @@ function extractFnSource(name) {
   return SRC06.slice(start, i);
 }
 function evalHandle(fnText) {
-  return new Function("return " + fnText)();
+  return new Function(src06ScopeDeps() + "return " + fnText)();
+}
+function src06ScopeDeps() {
+  const constLine = /^const SEGMENT_PART_SIZE_MAX = \d+;$/m.exec(SRC06);
+  assert.ok(constLine, "evalHandle: src/06 must keep one top-level SEGMENT_PART_SIZE_MAX declaration to inject into the isolated eval scope");
+  const retryConst = /^const SEGMENT_RETRY_BASE_MS = \d+;$/m.exec(SRC06);
+  const retryDeps = retryConst ? "\n" + retryConst[0] + "\n" + extractFnSource("segmentRetryDelayMs") : "";
+  return constLine[0] + "\n" + extractFnSource("parseUpstreamTimeoutMs") + retryDeps + "\n";
 }
 function sourceOf(chunks) {
   return new ReadableStream({ start(c) { for (const ch of chunks) c.enqueue(new Uint8Array(ch)); c.close(); } });
@@ -943,7 +950,7 @@ test("D-1 INV-AGG aggregateSegmentedStream: headers-phase failure retries up to 
     return { status: 0, stream: null };
   };
   await assert.rejects(
-    () => collectSlices(agg(segFetch, 2)),
+    () => collectSlices(agg(segFetch, 2, { segmentRetryBaseMs: 0, retrySleep: () => Promise.resolve() })),
     /status 0/,
     "a segment whose headers never arrive must hard-error after retries are exhausted"
   );
@@ -1031,7 +1038,7 @@ test("D-1 INV-AGG merge-grain stall window: a silent upstream must flush its coa
   });
   const t0 = Date.now();
   await assert.rejects(
-    () => collectSlices(agg(segFetch, [100], { concurrency: 1, mergeBytes: 8192 })),
+    () => collectSlices(agg(segFetch, [100], { concurrency: 1, mergeBytes: 8192, stallDeadlineMs: 1500 })),
     /stalled after 4 of 100/,
     "a segment that goes permanently silent short of its declared length must hard-error like a short body does (sliceReadableStream parity), not silently close"
   );
@@ -1073,7 +1080,7 @@ test("F3 STALL window: a live source trickling every 220ms must complete byte-ex
       cancel() { sourceStopped = true; },
     }),
   });
-  const pieces = await collectSlices(agg(segFetch, [12], { concurrency: 1, mergeBytes: 8192 }));
+  const pieces = await collectSlices(agg(segFetch, [12], { concurrency: 1, mergeBytes: 8192, stallDeadlineMs: 1500 }));
   let off = 0; const joined = new Uint8Array(12);
   for (const p of pieces) { assert.ok(p.byteLength > 0, "no zero-length chunk"); joined.set(p, off); off += p.byteLength; }
   assert.equal(off, 12, "a 220ms-gap live source must deliver all 12 bytes");
@@ -1094,7 +1101,114 @@ test("F3 STALL lower-bound: a single ~900ms inter-chunk silence must survive, br
       },
     }),
   });
-  const pieces = await collectSlices(agg(segFetch, [4], { concurrency: 1, mergeBytes: 8192 }));
+  const pieces = await collectSlices(agg(segFetch, [4], { concurrency: 1, mergeBytes: 8192, stallDeadlineMs: 1500 }));
   let off = 0; for (const p of pieces) off += p.byteLength;
   assert.equal(off, 4, "a live source with one 900ms pause must still deliver all 4 bytes (deadline must be well above 900ms)");
+});
+
+test("G2 stall deadline honors an explicit stallDeadlineMs option, not a hardcoded constant", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const segFetch = async () => ({
+    status: 206,
+    headers: { "content-range": "bytes 0-3/100" },
+    stream: new ReadableStream({
+      start(c) {
+        c.enqueue(new Uint8Array([1, 2, 3, 4]));
+      },
+      cancel() {},
+    }),
+  });
+  const t0 = Date.now();
+  await assert.rejects(
+    () => collectSlices(agg(segFetch, [100], { concurrency: 1, mergeBytes: 8192, stallDeadlineMs: 300 })),
+    /stalled after 4 of 100/,
+    "an explicit stallDeadlineMs must be honored"
+  );
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1200, "the stall must fire at the provided 300ms deadline, not a hardcoded 1500, took " + elapsed + "ms");
+});
+
+test("H1 segmentRetryDelayMs scheduler: exponential doubling per retry index with default and parse clamps", () => {
+  const delay = evalHandle(extractFnSource("segmentRetryDelayMs"));
+  assert.equal(delay(0, 40), 40, "first retry waits the base");
+  assert.equal(delay(1, 40), 80, "second retry doubles");
+  assert.equal(delay(2, 40), 160, "third retry doubles again");
+  assert.equal(delay(3, 100), 800, "growth follows 2^attempt");
+  assert.equal(delay(0, undefined), 250, "an undefined base falls back to the shipped default");
+  const parse = evalHandle(extractFnSource("parseSegmentRetryBaseMs"));
+  assert.equal(parse("0"), 0, "explicit zero is the escape valve: disable backoff, keep immediate retry");
+  assert.equal(parse("abc"), 250, "junk falls back to the default");
+  assert.equal(parse(-1), 250, "negative falls back to the default");
+  assert.equal(parse(undefined), 250, "unset falls back to the default");
+  assert.equal(parse(1e9), 10000, "an operator misconfiguration cannot stretch the backoff base past 10s");
+});
+
+test("H1 aggregateSegmentedStream: a retryable segment failure waits exponentially before each retry, keeping the retry budget and the post-wait cancel/failure checks", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const perSegment = new Map();
+  const slept = [];
+  const segFetch = async (i) => {
+    perSegment.set(i, (perSegment.get(i) || 0) + 1);
+    return { status: 0, stream: null };
+  };
+  await assert.rejects(
+    () => collectSlices(agg(segFetch, 2, { segmentRetryBaseMs: 60, retrySleep: (ms) => { slept.push(ms); return Promise.resolve(); } })),
+    /status 0/,
+    "the stream must still hard-error once retries are exhausted"
+  );
+  assert.equal(perSegment.get(0), 3, "retry budget stays 1 initial + 2 retries for segment 0");
+  assert.equal(perSegment.get(1), 3, "retry budget stays 1 initial + 2 retries for segment 1");
+  const sorted = slept.slice().sort((a, b) => a - b);
+  assert.deepEqual(sorted, [60, 60, 120, 120], "one exponential wait before every retry: 60 then 120 per segment");
+});
+
+test("H2 aggregateSegmentedStream: a retryable headers-phase failure cancels the rejected response body before the backoff wait", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const events = [];
+  let attempt = 0;
+  const segFetch = async () => {
+    attempt++;
+    if (attempt === 1) {
+      return { status: 503, stream: { cancel() { events.push("cancel"); return Promise.resolve(); } } };
+    }
+    return { status: 206, stream: sourceOf([[7, 8, 9]]) };
+  };
+  const stream = agg(segFetch, 1, { segmentRetryBaseMs: 60, retrySleep: (ms) => { events.push("sleep:" + ms); return Promise.resolve(); } });
+  const pieces = await collectSlices(stream);
+  assert.deepEqual(events, ["cancel", "sleep:60"], "the rejected body must be cancelled before the retry backoff, exactly once");
+  assert.equal(Buffer.concat(pieces).toString("hex"), "070809", "the aggregate stays byte-exact after the retry succeeds");
+});
+
+test("H2 aggregateSegmentedStream: a rejected cancel of the failed body must not block the backoff or the retry", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const events = [];
+  let attempt = 0;
+  const segFetch = async () => {
+    attempt++;
+    if (attempt === 1) {
+      return { status: 503, stream: { cancel() { events.push("cancel-attempted"); return Promise.reject(new Error("cancel boom")); } } };
+    }
+    return { status: 206, stream: sourceOf([[1, 2]]) };
+  };
+  const stream = agg(segFetch, 1, { segmentRetryBaseMs: 60, retrySleep: (ms) => { events.push("sleep:" + ms); return Promise.resolve(); } });
+  const pieces = await collectSlices(stream);
+  assert.deepEqual(events, ["cancel-attempted", "sleep:60"], "the retry chain advances on schedule even when the body cancel rejects");
+  assert.equal(Buffer.concat(pieces).toString("hex"), "0102", "the aggregate stays byte-exact after the retry succeeds");
+});
+
+test("H2 aggregateSegmentedStream: a synchronous throw from the failed body cancel must not block the backoff or the retry", async () => {
+  const agg = evalHandle(extractFnSource("aggregateSegmentedStream"));
+  const events = [];
+  let attempt = 0;
+  const segFetch = async () => {
+    attempt++;
+    if (attempt === 1) {
+      return { status: 429, stream: { cancel() { throw new Error("cancel sync throw"); } } };
+    }
+    return { status: 206, stream: sourceOf([[3, 4]]) };
+  };
+  const stream = agg(segFetch, 1, { segmentRetryBaseMs: 60, retrySleep: (ms) => { events.push("sleep:" + ms); return Promise.resolve(); } });
+  const pieces = await collectSlices(stream);
+  assert.deepEqual(events, ["sleep:60"], "the retry chain advances on schedule even when the body cancel throws synchronously");
+  assert.equal(Buffer.concat(pieces).toString("hex"), "0304", "the aggregate stays byte-exact after the retry succeeds");
 });

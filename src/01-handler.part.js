@@ -575,12 +575,13 @@ export default {
           let segPartSize = parseSegmentPartSize(env && env.STREAM_SEGMENT_PART_SIZE);
           const segMaxSegments = parseSegmentMaxSegments(env && env.STREAM_SEGMENT_MAX_SEGMENTS);
           const segMergeBytes = parseSegmentMergeBytes(env && env.STREAM_SEGMENT_MERGE_BYTES);
-          if (rangeCount > segPartSize) {
-            let segCount = Math.ceil(rangeCount / segPartSize);
-            if (segCount > segMaxSegments) {
-              segCount = segMaxSegments;
-              segPartSize = Math.ceil(rangeCount / segCount);
-            }
+          const segRetryBaseMs = parseSegmentRetryBaseMs(env && env.STREAM_SEGMENT_RETRY_BASE_MS);
+          let segCount = rangeCount > segPartSize ? Math.ceil(rangeCount / segPartSize) : 0;
+          if (segCount > segMaxSegments) {
+            segCount = segMaxSegments;
+            segPartSize = Math.ceil(rangeCount / segCount);
+          }
+          if (segCount > 0 && segPartSize <= SEGMENT_PART_SIZE_MAX) {
             const firstRangeStart = clientStart;
             const fanoutAbort = new AbortController();
             try {
@@ -615,11 +616,16 @@ export default {
                   if (!retryableProbe || fanoutAbort.signal.aborted) break;
                   try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
                   firstSegRes = null;
+                  if (probeAttempt === 2) break;
+                  await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                  if (fanoutAbort.signal.aborted) break;
                 }
               } catch (probeFetchErr) {
                 if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
                 if (probeAttempt === 2) break;
                 firstSegRes = null;
+                await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
               } finally {
                 clearTimeout(probeTimer);
               }
@@ -682,6 +688,8 @@ export default {
             const agg = aggregateSegmentedStream(segFetch, segments, {
               concurrency: segConcurrency,
               mergeBytes: segMergeBytes,
+              segmentRetryBaseMs: segRetryBaseMs,
+              stallDeadlineMs: upstreamTimeoutMs,
               signal: fanoutAbort.signal
             });
             if (!agg) {
