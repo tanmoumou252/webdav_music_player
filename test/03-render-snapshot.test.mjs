@@ -10,8 +10,8 @@ function compactTemplate(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-const GOLDEN_SHA256 = "cc230e83b6eb15d120f55705f57e2cbb07394111e812c835ef4fca694630a1e8";
-const GOLDEN_LENGTH = 121675;
+const GOLDEN_SHA256 = "5002adc25ea7bcb9a91d71726c2691d027e5af41e0cd73b9d78b53425242def0";
+const GOLDEN_LENGTH = 121896;
 
 test("Tier-3 renderHTML snapshot: golden length & sha256 master", () => {
   const html = renderHTML();

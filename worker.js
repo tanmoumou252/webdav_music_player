@@ -3293,8 +3293,11 @@ function renderHTML() {
       audio.onerror = async () => {
         if (token !== playToken) return;
         let originProbeFailed = false;
+        const probeAbort = new AbortController();
+        const probeTimer = setTimeout(() => probeAbort.abort(), 15000);
         try {
-          const check = await fetch(streamUrl, { headers: { 'Range': 'bytes=0-65535' } });
+          const check = await fetch(streamUrl, { headers: { 'Range': 'bytes=0-65535' }, signal: probeAbort.signal });
+          clearTimeout(probeTimer);
           if (token !== playToken) return;
           if (!check.ok) {
             originProbeFailed = true;
@@ -3302,6 +3305,7 @@ function renderHTML() {
             if (errJson.diagnostic) reportDiagnostic(errJson.diagnostic, { quiet: isAuto ? true : false });
           }
         } catch(e) {
+          clearTimeout(probeTimer);
           if (token !== playToken) return;
           originProbeFailed = true;
         }
