@@ -1391,9 +1391,13 @@ function aggregateSegmentedStream(segFetch, segments, options) {
   const queues = new Map();
   const pendingSeg = new Map();
   const inFlight = new Set();
-  let wake = null;
   let consumeIndex = 0;
-  const notify = () => { if (wake) { const w = wake; wake = null; w(); } };
+  const waiters = new Set();
+  const notify = () => {
+    const list = [...waiters];
+    waiters.clear();
+    for (const w of list) { try { w(); } catch (wErr) {} }
+  };
 
   function fail(e) {
     if (failed) return;
@@ -1486,6 +1490,10 @@ function aggregateSegmentedStream(segFetch, segments, options) {
           notify();
           return;
         }
+        while (!cancelRequested && !failed && i !== consumeIndex && i !== consumeIndex + 1) {
+          await new Promise((resolve) => { waiters.add(resolve); });
+        }
+        if (cancelRequested || failed) return;
         pendingRead = reader.read();
       }
     } catch (e) {
@@ -1561,13 +1569,14 @@ function aggregateSegmentedStream(segFetch, segments, options) {
                 queues.delete(i);
                 readers.delete(i);
                 consumeIndex = i + 1;
+                notify();
                 continue;
               }
               controller.enqueue(item.value);
               return;
             }
             if (readers.has(i) || inFlight.has(i)) {
-              await new Promise((resolve) => { wake = resolve; });
+              await new Promise((resolve) => { waiters.add(resolve); });
               break;
             }
             if (failed) throw failed;
