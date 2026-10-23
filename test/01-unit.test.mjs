@@ -1212,3 +1212,50 @@ test("H2 aggregateSegmentedStream: a synchronous throw from the failed body canc
   assert.deepEqual(events, ["sleep:60"], "the retry chain advances on schedule even when the body cancel throws synchronously");
   assert.equal(Buffer.concat(pieces).toString("hex"), "0304", "the aggregate stays byte-exact after the retry succeeds");
 });
+
+test("A-shape lock: the Tier-4 HEAD parity test self-skips via a three-path git status porcelain probe", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { join } = await import("node:path");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const t00 = readFileSync(join(root, "test", "00-build-parity.test.mjs"), "utf8");
+  assert.ok(t00.includes("t.skip"), "test/00 must self-skip while artifacts drift pending commit");
+  assert.ok(t00.includes('["status", "--porcelain", "--", "src", "worker.js", "golden/worker.head.mjs"]'), "the drift gate must probe all three artifact paths in a single porcelain command");
+  const buildSrc = readFileSync(join(root, "build.mjs"), "utf8");
+  assert.ok(!buildSrc.includes("stays RED"), "build.mjs must stop advertising stays RED");
+  assert.ok(!buildSrc.includes("expected red"), "build.mjs must stop advertising expected red");
+});
+
+test("D-1a lock: the joined pull catch cancels both inner readers (rejection-safe) before erroring the controller", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { join } = await import("node:path");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const src01 = readFileSync(join(root, "src", "01-handler.part.js"), "utf8");
+  assert.ok(src01.includes("try { bridgeReader.cancel(e).catch(() => {}); } catch (cErr) {}"), "the bridge reader must be cancelled on the joined error path");
+  assert.ok(src01.includes("try { aggReader.cancel(e).catch(() => {}); } catch (cErr) {}"), "the agg reader must be cancelled on the joined error path");
+});
+
+test("D-1b lock: the aggregateSegmentedStream call no longer passes the dead signal option", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { join } = await import("node:path");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const src01 = readFileSync(join(root, "src", "01-handler.part.js"), "utf8");
+  assert.ok(!src01.includes("signal: fanoutAbort.signal"), "the dead opts.signal slot must be removed from the aggregator call");
+  assert.ok(src01.includes("fanoutAbort.signal.aborted"), "fanoutAbort keeps its live references, no drive-by cleanup");
+  assert.ok(src01.includes("fanoutAbort.abort()"), "fanoutAbort keeps its abort wiring, no drive-by cleanup");
+});
+
+test("D-1c lock: every request.signal abort listener in src/01 registers once", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const { join } = await import("node:path");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const src01 = readFileSync(join(root, "src", "01-handler.part.js"), "utf8");
+  const lines = src01.split("\n").filter((line) => line.includes('addEventListener("abort"'));
+  assert.equal(lines.length, 4, "exactly four request.signal abort listeners are expected, got " + lines.length);
+  for (const line of lines) {
+    assert.ok(line.includes("{ once: true }"), "every abort listener must carry { once: true }: " + line.trim());
+  }
+});

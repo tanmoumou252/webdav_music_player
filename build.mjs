@@ -73,7 +73,7 @@ if (baseline && cmp !== 0 && !RECORD && !VERIFY_STAGED) {
       reportDiff(assembled, baseline) +
       "  If the src/ change is intentional: run `node build.mjs --record` to advance the ratchet baseline,\n" +
       "  then commit worker.js + golden/worker.head.mjs + re-recorded test goldens together.\n" +
-      "  Until that commit exists, the Tier-4 test `src parts concat == git HEAD worker.js` is expected red."
+      "  Until that commit exists the Tier-4 HEAD comparison self-skips (see test/00); audit the staged state with `node build.mjs --verify-staged` before committing."
   );
   process.exit(1);
 }
@@ -124,7 +124,7 @@ if (VERIFY_STAGED) {
   if (baseline && cmp === 0) {
     console.log("build: HEAD baseline is byte-equal as well — the staged state is commit-consistent.");
   } else {
-    console.log(`build:   node --test "test/*.test.mjs"   (Tier-4 "src parts concat == git HEAD worker.js" stays RED until you commit — that is the intended handoff)`);
+    console.log("build:   node --test \"test/*.test.mjs\"   (Tier-4 HEAD comparison self-skips while src/worker.js/golden/worker.head.mjs drift pending commit; run `node build.mjs --verify-staged` before committing — that is the intended handoff)");
   }
   process.exit(0);
 }
@@ -173,7 +173,7 @@ if (baseline && cmp === 0) {
   );
   console.log(`build: ${partFiles.length} parts, ${assembled.length} bytes, drift vs git show HEAD:worker.js`);
   console.log(reportDiff(assembled, baseline));
-  console.log("build: `node build.mjs` (strict) stays RED until this change is committed — that is the intended handoff.");
+  console.log("build: strict mode reports drift until --record + commit; the test suite self-skips the HEAD comparison meanwhile, and --verify-staged audits the staged state before you commit.");
 } else {
   console.log(
     `build: RECORD MODE (no git baseline) — ${partFiles.length} parts, ${assembled.length} bytes, artifacts rewritten from src/`

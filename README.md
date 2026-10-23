@@ -83,7 +83,7 @@ node build.mjs
 node build.mjs --record
 ```
 
-它会重写 `worker.js` 与 `build/out/worker.check.mjs`（`golden/worker.head.mjs` 仅在与拼接结果不同步时才重写），并打印与 `HEAD` 的漂移偏移。拼接结果先落 `build/out/worker.check.mjs` 并立即跑 `node --check`，语法不过则删除该中间产物后退出——此时 `worker.js` 与 `golden/worker.head.mjs` 都不会被写。**在人类提交之前**，`node build.mjs`（strict）保持红灯、Tier-4 的「与 `git HEAD` 逐字节相等」那一条也按设计保持红灯，提交后自动转绿；strict 模式在红灯时**不写任何文件**（该性质可用 `git hash-object worker.js golden/worker.head.mjs build/out/worker.check.mjs` 在红灯前后各跑一次对照验证）。golden 记录的重录入口是 `node test/tools/record.mjs handler` 与 `node test/tools/record.mjs render`（无默认模式，每次重录都是一次可审查的显式动作）。
+它会重写 `worker.js` 与 `build/out/worker.check.mjs`（`golden/worker.head.mjs` 仅在与拼接结果不同步时才重写），并打印与 `HEAD` 的漂移偏移。拼接结果先落 `build/out/worker.check.mjs` 并立即跑 `node --check`，语法不过则删除该中间产物后退出——此时 `worker.js` 与 `golden/worker.head.mjs` 都不会被写。**在人类提交之前**，`node build.mjs`（strict）持续报告与 HEAD 的漂移并保持红灯（exit 1）；测试套件中 Tier-4 的「与 `git HEAD` 逐字节相等」一条在 src/worker.js/golden 漂移窗口自跳过（skipped），提交后自动恢复必跑；提交前可用 `node build.mjs --verify-staged` 审计暂存区；strict 模式在红灯时**不写任何文件**（该性质可用 `git hash-object worker.js golden/worker.head.mjs build/out/worker.check.mjs` 在红灯前后各跑一次对照验证）。golden 记录的重录入口是 `node test/tools/record.mjs handler` 与 `node test/tools/record.mjs render`（无默认模式，每次重录都是一次可审查的显式动作）。
 
 ### 回归测试
 

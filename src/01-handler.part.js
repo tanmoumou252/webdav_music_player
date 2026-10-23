@@ -473,7 +473,7 @@ export default {
       try {
         if (request.signal) {
           if (request.signal.aborted) upstreamAbort.abort();
-          else request.signal.addEventListener("abort", () => upstreamAbort.abort());
+          else request.signal.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
         }
       } catch (sigErr) {}
       const upstreamTimer = setTimeout(() => upstreamAbort.abort(), upstreamTimeoutMs);
@@ -587,7 +587,7 @@ export default {
             try {
               if (request.signal) {
                 if (request.signal.aborted) fanoutAbort.abort();
-                else request.signal.addEventListener("abort", () => fanoutAbort.abort());
+                else request.signal.addEventListener("abort", () => fanoutAbort.abort(), { once: true });
               }
             } catch (sigErr) {}
             const firstSegEnd = Math.min(firstRangeStart + segPartSize - 1, rangeEnd);
@@ -600,7 +600,7 @@ export default {
               try {
                 if (request.signal) {
                   if (request.signal.aborted) probeAbort.abort();
-                  else request.signal.addEventListener("abort", () => probeAbort.abort());
+                  else request.signal.addEventListener("abort", () => probeAbort.abort(), { once: true });
                 }
               } catch (probeSigErr) {}
               const probeTimer = setTimeout(() => probeAbort.abort(), upstreamTimeoutMs);
@@ -668,7 +668,7 @@ export default {
               try {
                 if (request.signal) {
                   if (request.signal.aborted) segAbort.abort();
-                  else request.signal.addEventListener("abort", () => segAbort.abort());
+                  else request.signal.addEventListener("abort", () => segAbort.abort(), { once: true });
                 }
               } catch (sigErr) {}
               let segRes;
@@ -689,8 +689,7 @@ export default {
               concurrency: segConcurrency,
               mergeBytes: segMergeBytes,
               segmentRetryBaseMs: segRetryBaseMs,
-              stallDeadlineMs: upstreamTimeoutMs,
-              signal: fanoutAbort.signal
+              stallDeadlineMs: upstreamTimeoutMs
             });
             if (!agg) {
               const reSliced = sliceReadableStream(res.body, clientStart, rangeCount);
@@ -759,6 +758,8 @@ export default {
                   }
                   controller.close();
                 } catch (e) {
+                  try { bridgeReader.cancel(e).catch(() => {}); } catch (cErr) {}
+                  try { aggReader.cancel(e).catch(() => {}); } catch (cErr) {}
                   controller.error(e);
                 }
               },
