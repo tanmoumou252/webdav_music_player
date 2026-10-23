@@ -44,9 +44,41 @@ export default {
     }
 
     if (url.pathname === "/js/jsmediatags.min.js") {
+      let kvBody = null;
       try {
-        const cdnRes = await fetch("https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js");
+        kvBody = await env.MUSIC_KV.get("jsmediatags_3_9_5");
+      } catch (kvErr) {
+        kvBody = null;
+      }
+      if (kvBody) {
+        return new Response(kvBody, {
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/javascript; charset=utf-8",
+            "Cache-Control": "public, max-age=604800"
+          }
+        });
+      }
+      try {
+        const cdnTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+        const cdnAbort = new AbortController();
+        const cdnTimer = setTimeout(() => cdnAbort.abort(), cdnTimeoutMs);
+        let cdnRes;
+        try {
+          cdnRes = await fetch("https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js", { signal: cdnAbort.signal });
+        } finally {
+          clearTimeout(cdnTimer);
+        }
+        if (!cdnRes.ok) {
+          try { if (cdnRes.body) cdnRes.body.cancel(); } catch (cancelErr) {}
+          return new Response("// jsmediatags unavailable", {
+            headers: { ...corsHeaders, "Content-Type": "application/javascript" }
+          });
+        }
         const body = await cdnRes.text();
+        try {
+          await env.MUSIC_KV.put("jsmediatags_3_9_5", body, { expirationTtl: 604800 });
+        } catch (putErr) {}
         return new Response(body, {
           headers: {
             ...corsHeaders,
@@ -280,7 +312,7 @@ export default {
           const songMap = new Map();
 
           for (const src of sources) {
-            const res = await fetchWebDavList(src);
+            const res = await fetchWebDavList(src, env);
             debugLogs.push(res.debug);
 
             if (res.diagnostic) diagnosticErrors.push(res.diagnostic);
@@ -314,7 +346,7 @@ export default {
             }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
           }
 
-          const res = await fetchWebDavList(src);
+          const res = await fetchWebDavList(src, env);
           const singleMap = new Map();
           (res.items || []).forEach(i => {
             const normKey = normalizeSongKey(i.name);
@@ -424,9 +456,10 @@ export default {
         forwardHeaders.set("Authorization", "Basic " + btoa(unescape(encodeURIComponent(`${src.user || ""}:${src.pass || ""}`))));
       }
 
-      const clientRange = parseSingleByteRange(request.headers.get("Range"));
-      if (clientRange) {
-        forwardHeaders.set("Range", request.headers.get("Range"));
+      const rawClientRange = request.headers.get("Range");
+      const clientRange = parseSingleByteRange(rawClientRange);
+      if (rawClientRange) {
+        forwardHeaders.set("Range", rawClientRange);
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
@@ -435,11 +468,26 @@ export default {
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
+      const upstreamTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+      const upstreamAbort = new AbortController();
       try {
-        const res = await fetch(targetUrl, {
-          method: isHead ? "GET" : request.method,
-          headers: forwardHeaders
-        });
+        if (request.signal) {
+          if (request.signal.aborted) upstreamAbort.abort();
+          else request.signal.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
+        }
+      } catch (sigErr) {}
+      const upstreamTimer = setTimeout(() => upstreamAbort.abort(), upstreamTimeoutMs);
+      let res;
+      try {
+        try {
+          res = await fetch(targetUrl, {
+            method: isHead ? "GET" : request.method,
+            headers: forwardHeaders,
+            signal: upstreamAbort.signal
+          });
+        } finally {
+          clearTimeout(upstreamTimer);
+        }
 
         if (isHead && (res.ok || res.status === 206 || res.status === 416)) {
           let headTotal = parseContentRangeTotal(res.headers.get("Content-Range"));
@@ -523,6 +571,212 @@ export default {
           }
           const rangeEnd = clientRange.end !== null ? Math.min(clientRange.end, upstreamTotal - 1) : upstreamTotal - 1;
           const rangeCount = rangeEnd - clientStart + 1;
+          const segConcurrency = parseSegmentConcurrency(env && env.STREAM_SEGMENT_CONCURRENCY);
+          let segPartSize = parseSegmentPartSize(env && env.STREAM_SEGMENT_PART_SIZE);
+          const segMaxSegments = parseSegmentMaxSegments(env && env.STREAM_SEGMENT_MAX_SEGMENTS);
+          const segMergeBytes = parseSegmentMergeBytes(env && env.STREAM_SEGMENT_MERGE_BYTES);
+          const segRetryBaseMs = parseSegmentRetryBaseMs(env && env.STREAM_SEGMENT_RETRY_BASE_MS);
+          let segCount = rangeCount > segPartSize ? Math.ceil(rangeCount / segPartSize) : 0;
+          if (segCount > segMaxSegments) {
+            segCount = segMaxSegments;
+            segPartSize = Math.ceil(rangeCount / segCount);
+          }
+          if (segCount > 0 && segPartSize <= SEGMENT_PART_SIZE_MAX) {
+            const firstRangeStart = clientStart;
+            const fanoutAbort = new AbortController();
+            try {
+              if (request.signal) {
+                if (request.signal.aborted) fanoutAbort.abort();
+                else request.signal.addEventListener("abort", () => fanoutAbort.abort(), { once: true });
+              }
+            } catch (sigErr) {}
+            const firstSegEnd = Math.min(firstRangeStart + segPartSize - 1, rangeEnd);
+            const firstSegHeaders = new Headers(forwardHeaders);
+            firstSegHeaders.set("Range", "bytes=" + firstRangeStart + "-" + firstSegEnd);
+            let firstSegRes = null;
+            let probeErr = null;
+            for (let probeAttempt = 0; probeAttempt < 3; probeAttempt++) {
+              const probeAbort = new AbortController();
+              try {
+                if (request.signal) {
+                  if (request.signal.aborted) probeAbort.abort();
+                  else request.signal.addEventListener("abort", () => probeAbort.abort(), { once: true });
+                }
+              } catch (probeSigErr) {}
+              const probeTimer = setTimeout(() => probeAbort.abort(), upstreamTimeoutMs);
+              try {
+                firstSegRes = await fetch(targetUrl, {
+                  method: "GET",
+                  headers: firstSegHeaders,
+                  signal: probeAbort.signal
+                });
+                if (firstSegRes.status === 206 && firstSegRes.body) break;
+                if (firstSegRes.status !== 206) {
+                  const retryableProbe = firstSegRes.status === 429 || firstSegRes.status >= 500;
+                  if (!retryableProbe || fanoutAbort.signal.aborted) break;
+                  try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
+                  firstSegRes = null;
+                  if (probeAttempt === 2) break;
+                  await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                  if (fanoutAbort.signal.aborted) break;
+                }
+              } catch (probeFetchErr) {
+                if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
+                if (probeAttempt === 2) break;
+                firstSegRes = null;
+                await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
+              } finally {
+                clearTimeout(probeTimer);
+              }
+            }
+            if (probeErr) {
+              try { if (res.body) res.body.cancel(); } catch (cancelErr) {}
+              throw probeErr;
+            }
+            if (firstSegRes && firstSegRes.status === 206 && !probeContentRangeOk(firstSegRes.headers.get("Content-Range"), firstRangeStart, firstSegEnd)) {
+              try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
+              firstSegRes = null;
+            }
+            if (!firstSegRes || firstSegRes.status !== 206 || !firstSegRes.body || res.headers.get("Content-Encoding")) {
+              if (firstSegRes) {
+                try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
+              }
+              const reSliced = sliceReadableStream(res.body, clientStart, rangeCount);
+              if (reSliced) {
+                respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+                respHeaders.set("Content-Length", String(rangeCount));
+                respHeaders.set("Accept-Ranges", "bytes");
+                return new Response(reSliced, { status: 206, statusText: "Partial Content", headers: respHeaders });
+              }
+              respHeaders.delete("Accept-Ranges");
+              return new Response(res.body, { status: res.status, statusText: res.statusText, headers: respHeaders });
+            }
+            const planned = [];
+            let segStart = firstRangeStart + segPartSize;
+            while (segStart <= rangeEnd) {
+              const segEnd = Math.min(segStart + segPartSize - 1, rangeEnd);
+              planned.push({ start: segStart, end: segEnd });
+              segStart = segEnd + 1;
+            }
+            const segFetch = async (idx) => {
+              const spec = planned[idx];
+              const segHeaders = new Headers(forwardHeaders);
+              segHeaders.set("Range", "bytes=" + spec.start + "-" + spec.end);
+              const segAbort = new AbortController();
+              let segTimer = null;
+              try {
+                if (request.signal) {
+                  if (request.signal.aborted) segAbort.abort();
+                  else request.signal.addEventListener("abort", () => segAbort.abort(), { once: true });
+                }
+              } catch (sigErr) {}
+              let segRes;
+              try {
+                try {
+                  segTimer = setTimeout(() => segAbort.abort(), upstreamTimeoutMs);
+                  segRes = await fetch(targetUrl, { method: "GET", headers: segHeaders, signal: segAbort.signal });
+                } finally {
+                  clearTimeout(segTimer);
+                }
+              } catch (segErr) {
+                return { status: 0, stream: null };
+              }
+              return { status: segRes.status, stream: segRes.body };
+            };
+            const segments = planned.map((spec) => spec.end - spec.start + 1);
+            const agg = aggregateSegmentedStream(segFetch, segments, {
+              concurrency: segConcurrency,
+              mergeBytes: segMergeBytes,
+              segmentRetryBaseMs: segRetryBaseMs,
+              stallDeadlineMs: upstreamTimeoutMs
+            });
+            if (!agg) {
+              const reSliced = sliceReadableStream(res.body, clientStart, rangeCount);
+              if (reSliced) {
+                respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+                respHeaders.set("Content-Length", String(rangeCount));
+                respHeaders.set("Accept-Ranges", "bytes");
+                return new Response(reSliced, { status: 206, statusText: "Partial Content", headers: respHeaders });
+              }
+              respHeaders.delete("Accept-Ranges");
+              return new Response(res.body, { status: res.status, statusText: res.statusText, headers: respHeaders });
+            }
+            try { if (res.body) res.body.cancel(); } catch (cancelErr) {}
+            const firstBodyLen = Math.min(segPartSize, rangeCount);
+            const bridged = new ReadableStream({
+              start(c) {
+                const reader = firstSegRes.body.getReader();
+                let sent = 0;
+                const pump = async () => {
+                  try {
+                    for (;;) {
+                      const chunk = await reader.read();
+                      if (chunk.done) {
+                        if (sent < firstBodyLen) {
+                          c.error(new Error("first segment body ended after " + sent + " of " + firstBodyLen + " bytes"));
+                          return;
+                        }
+                        c.close();
+                        return;
+                      }
+                      if (sent + chunk.value.byteLength > firstBodyLen) {
+                        const remain = firstBodyLen - sent;
+                        if (remain > 0) c.enqueue(chunk.value.subarray(0, remain));
+                        sent = firstBodyLen;
+                        try { await reader.cancel(); } catch (cancelErr) {}
+                        c.close();
+                        return;
+                      }
+                      sent += chunk.value.byteLength;
+                      c.enqueue(chunk.value);
+                      if (sent >= firstBodyLen) {
+                        try { await reader.cancel(); } catch (cancelErr) {}
+                        c.close();
+                        return;
+                      }
+                    }
+                  } catch (e) {
+                    c.error(e);
+                  }
+                };
+                pump();
+              }
+            });
+            const joined = new ReadableStream({
+              async pull(controller) {
+                try {
+                  const chunk = await bridgeReader.read();
+                  if (!chunk.done) {
+                    controller.enqueue(chunk.value);
+                    return;
+                  }
+                  const achunk = await aggReader.read();
+                  if (!achunk.done) {
+                    controller.enqueue(achunk.value);
+                    return;
+                  }
+                  controller.close();
+                } catch (e) {
+                  try { bridgeReader.cancel(e).catch(() => {}); } catch (cErr) {}
+                  try { aggReader.cancel(e).catch(() => {}); } catch (cErr) {}
+                  controller.error(e);
+                }
+              },
+              cancel(reason) {
+                try { bridgeReader.cancel(reason); } catch (cErr) {}
+                try { aggReader.cancel(reason); } catch (cErr) {}
+              }
+            });
+            const bridgeReader = bridged.getReader();
+            const aggReader = agg.getReader();
+            respHeaders.delete("Content-Range");
+            respHeaders.delete("Content-Length");
+            respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+            respHeaders.set("Content-Length", String(rangeCount));
+            respHeaders.set("Accept-Ranges", "bytes");
+            return new Response(joined, { status: 206, statusText: "Partial Content", headers: respHeaders });
+          }
           const sliced = sliceReadableStream(res.body, clientStart, rangeCount);
           if (sliced) {
             respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
@@ -548,15 +802,16 @@ export default {
           headers: respHeaders
         });
       } catch (networkErr) {
-        const diag = generateDiagnostic(0, networkErr.message, targetUrl, request.method, src.name, "");
+        const isAbort = networkErr && networkErr.name === "AbortError";
+        const diag = generateDiagnostic(isAbort ? 504 : 0, networkErr.message, targetUrl, request.method, src.name, "");
         if (await requireAdminSafe()) {
           return new Response(JSON.stringify({ error: diag.title, diagnostic: diag }), {
-            status: 502,
+            status: isAbort ? 504 : 502,
             headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
           });
         }
-        return new Response(JSON.stringify({ error: "无法连通源站", diagnostic: null }), {
-          status: 502,
+        return new Response(JSON.stringify({ error: isAbort ? "源站响应超时" : "无法连通源站", diagnostic: null }), {
+          status: isAbort ? 504 : 502,
           headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
         });
       }

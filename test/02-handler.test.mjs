@@ -398,3 +398,696 @@ test("stream GET playback path is untouched by the HEAD interception: the same o
     assert.equal(body, "0123456789", "the GET body streams through unchanged");
   } finally { globalThis.fetch = prevFetch; }
 });
+
+test("stream upstream timeout: a hung origin is aborted into 504 with a desensitized body (non-admin)", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }), STREAM_FETCH_TIMEOUT_MS: "500" };
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
+    const sig = init && init.signal;
+    if (!sig) return;
+    if (sig.aborted) { reject(sig.reason); return; }
+    sig.addEventListener("abort", () => reject(sig.reason));
+  });
+  try {
+    const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout-guard: handler hung past 3s")), 3000));
+    const res = await Promise.race([worker.fetch(makeRequest({ method: "GET", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3" }), env), guard]);
+    assert.equal(res.status, 504, "S-3: a header-phase timeout must answer 504, never an infinite hang or a 502");
+    const body = JSON.parse(await res.text());
+    assert.equal(body.error, "源站响应超时", "S-3: non-admin body must be the desensitized timeout text");
+    assert.equal(body.diagnostic, null, "S-3: non-admin must not leak the diagnostic");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("stream upstream timeout: admin receives the abort diagnostic", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]), admin_pass: F.ADMIN_HASH, ["session_" + "f".repeat(64)]: JSON.stringify({ created: FROZEN_NOW }) }), STREAM_FETCH_TIMEOUT_MS: "500" };
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
+    const sig = init && init.signal;
+    if (!sig) return;
+    if (sig.aborted) { reject(sig.reason); return; }
+    sig.addEventListener("abort", () => reject(sig.reason));
+  });
+  try {
+    const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout-guard")), 3000));
+    const res = await Promise.race([worker.fetch(makeRequest({ method: "GET", url: "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3", headers: { cookie: "admin_token=" + "f".repeat(64) } }), env), guard]);
+    assert.equal(res.status, 504, "S-3: admin path also answers 504");
+    const body = JSON.parse(await res.text());
+    assert.ok(body.diagnostic, "S-3: admin receives the diagnostic object");
+    assert.ok(String(body.diagnostic.title || "").length > 0, "S-3/E-4: the 504 diagnostic carries a non-empty title for the admin panel");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-3 stream: an already-aborted client signal aborts the upstream fetch and is not a normal successful stream", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }), STREAM_FETCH_TIMEOUT_MS: "5000" };
+  const prevFetch = globalThis.fetch;
+  let sawSignalAborted = false, upstreamCalled = false;
+  globalThis.fetch = (input, init) => {
+    upstreamCalled = true;
+    const sig = init && init.signal;
+    sawSignalAborted = !!(sig && sig.aborted);
+    return new Promise((resolve, reject) => {
+      if (!sig) return;
+      if (sig.aborted) return reject(sig.reason);
+      sig.addEventListener("abort", () => reject(sig.reason));
+    });
+  };
+  const ac = new AbortController(); ac.abort(); // client already gone
+  try {
+    const req = new Request("https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3", { method: "GET", signal: ac.signal });
+    const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("guard: handler hung past 3s")), 3000));
+    const res = await Promise.race([worker.fetch(req, env), guard]);
+    assert.equal(upstreamCalled, true, "upstream fetch attempted");
+    assert.equal(sawSignalAborted, true, "the merged client signal must reach the upstream fetch already-aborted");
+    assert.equal(res.status, 504, "an aborted client surfaces via the AbortError→504 path (body discarded by runtime)");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+// ---- D-1 分段并发（handler 级）----
+
+const STREAM_URL = "https://app.example.com/api/stream?sourceId=a&file=Alpha%20-%20One.mp3";
+const STREAM_ENV = () => ({ MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) });
+
+// D-1 并发分发：大区间（超出 PartSize）→ stub 收到多个带 Range 头的段请求，客户端收 206 且拼接逐字节正确。
+// PartSize 默认 1MiB，测试用 STREAM_SEGMENT_PART_SIZE=100 收窄触发域（rangeCount=400 > 100）。
+// D-1 fixtures: the PartSize knob clamps at 65536, so fan-out tests synthesize a 400KB upstream
+// (RANGE_BODY_500 × 800) with deterministic, position-verifiable content.
+const RANGE_BODY_400K = F.RANGE_BODY_500.repeat(800);
+
+const streamEnv = (partSize) => {
+  const env = STREAM_ENV();
+  env.STREAM_SEGMENT_PART_SIZE = partSize;
+  return env;
+};
+
+const seg206 = (body, total) => (s, e) => new Response(body.slice(s, e + 1), {
+  status: 206,
+  statusText: "Partial Content",
+  headers: { "content-type": "audio/mpeg", "content-range": `bytes ${s}-${e}/${total}`, "content-length": String(e - s + 1) },
+});
+const segSlice = seg206(RANGE_BODY_400K, RANGE_BODY_400K.length);
+
+test("D-1 segmented concurrency: a large range fans out into multiple ranged upstream requests, response is a byte-exact 206", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_CONCURRENCY = "3";
+  const prevFetch = globalThis.fetch;
+  const rangeCalls = [];
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    rangeCalls.push(h.range || "(no range)");
+    // model a range-ignoring upstream: the FIRST request (raw client range forwarded verbatim) gets a whole 200;
+    // only the worker-issued segment sub-ranges get honest 206 slices.
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (m) return segSlice(parseInt(m[1], 10), parseInt(m[2], 10));
+    return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+  };
+  try {
+    const start = 65536, end = 399999; // 334464 bytes > one 65536 part → 6 segments
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    assert.equal(res.status, 206, "aggregated segments must answer 206");
+    assert.equal(res.headers.get("content-range"), `bytes ${start}-${end}/${RANGE_BODY_400K.length}`, "Content-Range must be the client's original range (E-5 reset trio)");
+    assert.equal(res.headers.get("content-length"), String(end - start + 1), "Content-Length must be the client's range count");
+    assert.equal(res.headers.get("accept-ranges"), "bytes");
+    const body = await res.text();
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1), "the concatenated stream must equal the client's range byte-for-byte");
+    assert.ok(rangeCalls.length >= 6, "multiple ranged segment requests must be issued, got " + rangeCalls.length);
+    const segCalls = rangeCalls.filter((r) => r !== `bytes=${start}-${end}`);
+    for (const r of segCalls) assert.match(r, /^bytes=\d+-\d+$/, "every segment fetch must carry an explicit ranged header");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 segmented concurrency: in-flight concurrency never exceeds the knob", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_CONCURRENCY = "2";
+  const prevFetch = globalThis.fetch;
+  let inFlight = 0, peak = 0, initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    await new Promise((r) => setTimeout(r, 5));
+    inFlight--;
+    return segSlice(s, e);
+  };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=0-399999" } }), env);
+    await res.text();
+    assert.ok(peak <= 2, "peak in-flight segment fetches must be <= concurrency knob, got " + peak);
+    assert.ok(peak >= 2, "the window must actually overlap (not fully serialized), got " + peak);
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 segment-0 downgrade: a 200 on the first segment response header aborts the fan-out, total upstream calls stay minimal, client still gets the local-slice 206", async () => {
+  const env = streamEnv("65536");
+  const prevFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    calls.push(h.range || "(no range)");
+    // every fetch (including fan-out segments) returns a plain 200 whole body
+    return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    assert.equal(res.status, 206, "the downgrade path must still serve the local-slice 206 (current single-connection behavior)");
+    assert.equal(res.headers.get("content-range"), `bytes ${start}-${end}/${RANGE_BODY_400K.length}`);
+    assert.ok(calls.length <= 2, "no bandwidth multiplication: total upstream calls must stay minimal, got " + calls.length);
+    const body = await res.text();
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1));
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 probe exhaustion degrades: probe network failures never 502 — the local-slice 206 always serves", async () => {
+  const env = streamEnv("65536");
+  const prevFetch = globalThis.fetch;
+  const calls = [];
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    calls.push(h.range || "(no range)");
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    // every probe/segment fetch dies at the network layer (limity origin shape)
+    throw new TypeError("fetch failed");
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    assert.equal(res.status, 206, "probe exhaustion must degrade to the local-slice 206, never a 502");
+    assert.equal(res.headers.get("content-range"), `bytes ${start}-${end}/${RANGE_BODY_400K.length}`);
+    const body = await res.text();
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1), "the degraded body must be the client's range byte-for-byte");
+    const probeCalls = calls.filter((r) => r.startsWith("bytes=65536-131071")).length;
+    assert.equal(probeCalls, 3, "the probe retried exactly 3 attempts (1 initial + 2 retries) before degrading, got " + probeCalls);
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 segment retry: a headers-phase 5xx is re-sent at most 2 times; a 416 is terminal with zero retries", async () => {
+  const env = streamEnv("65536");
+  const prevFetch = globalThis.fetch;
+  const statusLog = [];
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10);
+    if (s === 131072 && statusLog.length < 2) { statusLog.push("5xx"); return new Response("boom", { status: 503, statusText: "Service Unavailable" }); }
+    const e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    const text = await res.text();
+    assert.equal(statusLog.length, 2, "two 5xx headers-phase failures must have occurred before success");
+    assert.ok(statusLog.length <= 3, "5xx headers-phase failures retry at most 2 times (1+2 attempts), got " + statusLog.length);
+    assert.equal(text, RANGE_BODY_400K.slice(start, end + 1), "after retries succeed the aggregate stays byte-exact");
+  } finally { globalThis.fetch = prevFetch; }
+
+  const calls2 = [];
+  initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    calls2.push(h.range || "(no range)");
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10);
+    if (s === 131072) return new Response(null, { status: 416, statusText: "Range Not Satisfiable", headers: { "content-range": `bytes */${RANGE_BODY_400K.length}` } });
+    const e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    await res.arrayBuffer().catch(() => {});
+    const r416 = calls2.filter((r) => r.startsWith("bytes=131072-")).length;
+    assert.ok(r416 <= 1, "a terminal 4xx segment must never be retried, got " + r416 + " attempts");
+  } finally { globalThis.fetch = prevFetch; }
+
+  const calls3 = [];
+  initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    calls3.push(h.range || "(no range)");
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10);
+    if (s === 131072) return new Response("boom", { status: 503, statusText: "Service Unavailable" });
+    const e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    await res.arrayBuffer().catch(() => {});
+    const r503 = calls3.filter((r) => r.startsWith("bytes=131072-")).length;
+    assert.equal(r503, 3, "a persistently-5xx segment gets exactly 3 attempts (1 initial + 2 retries), got " + r503);
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 segment network-throw: a persistently-throwing segment gets exactly 3 attempts (1+2) then hard-errors the whole stream (status-0 retry cap, handler integration)", async () => {
+  const env = streamEnv("65536");
+  const prevFetch = globalThis.fetch;
+  const calls = [];
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    calls.push(h.range || "(no range)");
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    if (h.range === "bytes=131072-196607") throw new TypeError("fetch failed");
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    let errored = false;
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch (e) { errored = true; }
+    assert.equal(errored, true, "a persistently-throwing segment must hard-error the whole stream after retries exhaust");
+    const segAttempts = calls.filter((r) => r === "bytes=131072-196607").length;
+    assert.equal(segAttempts, 3, "the throwing segment gets exactly 3 attempts (1 initial + 2 retries) at the handler integration level, got " + segAttempts);
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 segment upstream timeout: a per-segment fetch hung past STREAM_FETCH_TIMEOUT_MS is aborted and retried, then hard-errors — the fan-out path never hangs unbounded", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_FETCH_TIMEOUT_MS = "500";
+  const prevFetch = globalThis.fetch;
+  const calls = [];
+  let initDone = false;
+  globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    calls.push(h.range || "(no range)");
+    if (!initDone) {
+      initDone = true;
+      resolve(new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } }));
+      return;
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (m && h.range === "bytes=131072-196607") {
+      const sig = init.signal;
+      if (sig.aborted) { reject(sig.reason); return; }
+      sig.addEventListener("abort", () => reject(sig.reason));
+      return;
+    }
+    if (!m) { resolve(new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } })); return; }
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    resolve(segSlice(s, e));
+  });
+  try {
+    const start = 65536, end = 399999;
+    const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout-guard: fan-out hung past 3s")), 3000));
+    const res = await Promise.race([worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env), guard]);
+    let errored = false;
+    let errMessage = "";
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch (e) {
+      errored = true;
+      errMessage = String(e && e.message);
+    }
+    assert.equal(errored, true, "a hung segment must surface as a stream error after its retries exhaust, never an unbounded hang");
+    assert.match(errMessage, /status 0 \(retries exhausted\)/, "the error must name the exhausted status-0 retry path");
+    const segAttempts = calls.filter((r) => r === "bytes=131072-196607").length;
+    assert.equal(segAttempts, 3, "a hung segment is aborted by the per-segment timer and retried exactly 3 times (1+2), got " + segAttempts);
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 body-interrupt: a segment body that dies mid-flight hard-errors the whole request, no silent retry re-pull", async () => {  const env = streamEnv("65536");
+  const prevFetch = globalThis.fetch;
+  const rangeCalls = [];
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    rangeCalls.push(h.range);
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    if (s === 65536 * 2) {
+      // declare 65536 bytes but deliver only 100, then close: a body-phase interruption
+      return new Response(new ReadableStream({
+        start(c) { c.enqueue(new Uint8Array(Buffer.from(RANGE_BODY_400K.slice(s, s + 100), "utf8"))); c.close(); },
+      }), { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": `bytes ${s}-${e}/${RANGE_BODY_400K.length}`, "content-length": String(e - s + 1) } });
+    }
+    return segSlice(s, e);
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    let errored = false;
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    } catch (e) { errored = true; }
+    assert.equal(errored, true, "a short segment body must surface as a stream error, never a silently truncated or re-pulled body");
+    const reissued = rangeCalls.filter((r) => r.startsWith(`bytes=${65536 * 2}-`)).length;
+    assert.equal(reissued, 1, "body-phase failure must NOT re-pull the segment (bytes already sent downstream cannot be unsent)");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+// ---- O-2：CDN fetch 超时 → 回退串逐字现状 ----
+test("O-2 jsmediatags CDN fetch: a hung CDN is aborted within STREAM_FETCH_TIMEOUT_MS and falls back verbatim", async () => {
+  const env = STREAM_ENV();
+  env.STREAM_FETCH_TIMEOUT_MS = "500";
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = (input, init) => new Promise((resolve, reject) => {
+    const sig = init && init.signal;
+    if (!sig) return;
+    if (sig.aborted) return reject(sig.reason);
+    sig.addEventListener("abort", () => reject(sig.reason));
+  });
+  try {
+    const guard = new Promise((_, rej) => setTimeout(() => rej(new Error("timeout-guard: CDN fetch hung past 3s")), 3000));
+    const res = await Promise.race([worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env), guard]);
+    assert.equal(res.status, 200, "the fallback is still a 200 response");
+    assert.equal(await res.text(), "// jsmediatags unavailable", "fallback body verbatim");
+    assert.equal(res.headers.get("cache-control"), null, "fallback carries no Cache-Control (verbatim current behavior)");
+    assert.equal(res.headers.get("content-type"), "application/javascript");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+// ---- D-5：多段 Range 透传 ----
+test("D-5 multi-range header: the raw Range header is forwarded upstream verbatim, clientRange stays null for the local-slice gate", async () => {
+  const env = STREAM_ENV();
+  const prevFetch = globalThis.fetch;
+  let sawRange = null, sawAE = null;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    sawRange = h.range || null;
+    sawAE = h["accept-encoding"] || null;
+    return new Response(F.RANGE_BODY_500, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": "500" } });
+  };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=0-1,5-6" } }), env);
+    assert.equal(sawRange, "bytes=0-1,5-6", "the raw multi-range header must reach the upstream verbatim");
+    assert.equal(sawAE, "identity", "identity pinning applies to the forwarded multi-range too");
+    assert.equal(res.status, 200, "an upstream 200 passes through as 200 (same degradation semantics as before, now with the header forwarded)");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+// ---- D-10：KV 固化四态 ----
+test("D-10 KV hit: the proxy serves the KV copy and never calls the CDN", async () => {
+  const env = STREAM_ENV();
+  env.MUSIC_KV.__store.set("jsmediatags_3_9_5", F.jsmediatagsBody);
+  const prevFetch = globalThis.fetch;
+  let cdnCalled = 0;
+  globalThis.fetch = async () => { cdnCalled++; return new Response("cdn-body", { status: 200 }); };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env);
+    assert.equal(await res.text(), F.jsmediatagsBody, "the KV copy is served verbatim");
+    assert.equal(cdnCalled, 0, "a KV hit must not touch the CDN");
+    assert.equal(res.headers.get("content-type"), "application/javascript; charset=utf-8");
+    assert.equal(res.headers.get("cache-control"), "public, max-age=604800");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-10 KV miss + CDN success: the body is served and the KV put happens (awaited) before the response returns", async () => {
+  const env = STREAM_ENV();
+  const prevFetch = globalThis.fetch;
+  const puts = [];
+  const origPut = env.MUSIC_KV.put.bind(env.MUSIC_KV);
+  env.MUSIC_KV.put = async (k, v) => { puts.push({ key: k, value: v }); return origPut(k, v); };
+  globalThis.fetch = async () => new Response(F.jsmediatagsBody, { status: 200 });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env);
+    assert.equal(await res.text(), F.jsmediatagsBody);
+    assert.equal(puts.length, 1, "exactly one KV put per CDN success");
+    assert.equal(puts[0].key, "jsmediatags_3_9_5", "the put uses the frozen key");
+    assert.equal(puts[0].value, F.jsmediatagsBody, "the put stores the full script body");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-10 KV miss + CDN throw: the fallback string is verbatim, no put", async () => {
+  const env = STREAM_ENV();
+  const prevFetch = globalThis.fetch;
+  const puts = [];
+  const origPut = env.MUSIC_KV.put.bind(env.MUSIC_KV);
+  env.MUSIC_KV.put = async (k, v) => { puts.push({ key: k }); return origPut(k, v); };
+  globalThis.fetch = async () => { throw new Error("cdn unreachable"); };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env);
+    assert.equal(await res.text(), "// jsmediatags unavailable", "fallback verbatim");
+    assert.equal(puts.length, 0, "no put on CDN failure");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-10 KV put throws: the client still receives the CDN body (error swallowed, never a 500)", async () => {
+  const env = STREAM_ENV();
+  const prevFetch = globalThis.fetch;
+  env.MUSIC_KV.put = async () => { throw new Error("kv put boom"); };
+  globalThis.fetch = async () => new Response(F.jsmediatagsBody, { status: 200 });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), F.jsmediatagsBody, "a KV put failure must not block the CDN body");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("D-1 fan-out leak guard: on a successful fan-out the initial whole-file res.body is cancelled exactly once, first segment still byte-exact", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_CONCURRENCY = "3";
+  const prevFetch = globalThis.fetch;
+  let wholeFileCancelCount = 0;
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (!initDone) {
+      initDone = true;
+      const r = new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+      const origCancel = r.body.cancel.bind(r.body);
+      r.body.cancel = async (reason) => { wholeFileCancelCount++; return origCancel(reason); };
+      return r;
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 0, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: `bytes=${start}-${end}` } }), env);
+    const body = await res.text();
+    assert.equal(res.status, 206, "successful fan-out still returns 206");
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1), "first segment + fan-out bytes must remain byte-exact");
+    assert.equal(wholeFileCancelCount, 1, "the discarded whole-file res.body must be cancelled exactly once on the success path");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("F1 CDN non-2xx: an error page is never cached into KV and never served as JS; the 2xx path caches with a self-heal TTL", async () => {
+  const env = STREAM_ENV();
+  const prevFetch = globalThis.fetch;
+  const putCalls = [];
+  env.MUSIC_KV.put = async (k, v, opts) => { putCalls.push([k, typeof v === "string" ? v.slice(0, 40) : v, opts]); };
+  globalThis.fetch = async () => new Response("<!doctype html><h1>502 Bad Gateway</h1>", { status: 502, statusText: "Bad Gateway" });
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env);
+    const body = await res.text();
+    assert.equal(res.status, 200, "the client still receives a loadable JS body");
+    assert.equal(body, "// jsmediatags unavailable", "a 502 CDN page must fall back, never pass through");
+    assert.equal(putCalls.length, 0, "a non-2xx CDN body must never be written into KV");
+  } finally { globalThis.fetch = prevFetch; }
+  const env2 = STREAM_ENV();
+  globalThis.fetch = async () => new Response("/*ok*/", { status: 200 });
+  try {
+    const res2 = await worker.fetch(makeRequest({ method: "GET", url: PAGE_URL + "/js/jsmediatags.min.js" }), env2);
+    assert.equal(await res2.text(), "/*ok*/", "the 2xx path still serves and caches");
+    const lastPut = env2.MUSIC_KV.__puts[env2.MUSIC_KV.__puts.length - 1];
+    assert.ok(lastPut && lastPut.opts && lastPut.opts.expirationTtl === 604800, "the success-path cache write must carry a self-heal TTL (存量脏值不再永久驻留)");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("F2 bridge short body: a first-segment 206 that ends before firstBodyLen must surface as a stream error, never a silently short 206", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_CONCURRENCY = "2";
+  const prevFetch = globalThis.fetch;
+  let initDone = false;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    if (s === 0) {
+      return new Response(RANGE_BODY_400K.slice(s, s + 10), {
+        status: 206, statusText: "Partial Content",
+        headers: { "content-type": "audio/mpeg", "content-range": "bytes " + s + "-" + e + "/" + RANGE_BODY_400K.length },
+      });
+    }
+    return segSlice(s, e);
+  };
+  try {
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=0-399999" } }), env);
+    assert.equal(res.status, 206, "fan-out begins");
+    await assert.rejects(() => res.text(), /first segment body ended after 10 of 65536/, "an early-ending first segment must hard-error the response stream");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("F2 probe content-range gate: a 206 whose span is not the requested one is rejected; the client still gets the byte-exact original range via single-connection slicing", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_CONCURRENCY = "3";
+  const prevFetch = globalThis.fetch;
+  let initDone = false;
+  let lyingProbeCancels = 0;
+  globalThis.fetch = async (input, init) => {
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (!initDone) {
+      initDone = true;
+      return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    }
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    const lying = new Response(RANGE_BODY_400K.slice(0, e - s + 1), {
+      status: 206, statusText: "Partial Content",
+      headers: { "content-type": "audio/mpeg", "content-range": "bytes 0-" + (e - s) + "/" + RANGE_BODY_400K.length },
+    });
+    const oc = lying.body.cancel.bind(lying.body);
+    lying.body.cancel = async (reason) => { lyingProbeCancels++; return oc(reason); };
+    return lying;
+  };
+  try {
+    const start = 65536, end = 399999;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    const body = await res.text();
+    assert.equal(res.status, 206, "the fallback still answers 206");
+    assert.equal(res.headers.get("content-range"), "bytes " + start + "-" + end + "/" + RANGE_BODY_400K.length, "Content-Range must stay the client's original span");
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1), "a misreported probe must degrade to a byte-exact single-connection slice, never splice foreign bytes");
+    assert.ok(lyingProbeCancels >= 1, "the discarded lying probe body must be cancelled");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("G1 fan-out cap gate: when the max-segments re-scale would push one segment past the 8 MiB PartSize ceiling, the fan-out is skipped and the client still gets the byte-exact range via the single-connection slice", async () => {
+  const env = STREAM_ENV();
+  env.STREAM_SEGMENT_PART_SIZE = "65536";
+  env.STREAM_SEGMENT_MAX_SEGMENTS = "1";
+  const prevFetch = globalThis.fetch;
+  const BIG_BODY = F.RANGE_BODY_500.repeat(16778);
+  const TOTAL = BIG_BODY.length;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    return new Response(BIG_BODY, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(TOTAL) } });
+  };
+  try {
+    const start = 0, end = 8388608;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    assert.equal(res.status, 206, "the slice fallback still answers 206");
+    assert.equal(res.headers.get("content-range"), "bytes " + start + "-" + end + "/" + TOTAL, "Content-Range must stay the client's original span");
+    assert.equal(res.headers.get("content-length"), String(end - start + 1));
+    const body = await res.text();
+    assert.equal(body, BIG_BODY.slice(start, end + 1), "single-connection slice must be byte-exact");
+    assert.equal(calls, 1, "no fan-out probe may be issued once the recomputed part size exceeds the 8 MiB cap, got " + calls + " upstream calls");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("G2 wiring: STREAM_FETCH_TIMEOUT_MS reaches the body-phase stall deadline through the handler into aggregateSegmentedStream", async () => {
+  const src01 = readFileSync(join(fileURLToPath(new URL(".", import.meta.url)), "..", "src", "01-handler.part.js"), "utf8");
+  assert.match(src01, /stallDeadlineMs:\s*upstreamTimeoutMs/, "structural lock: the handler must forward the resolved upstream timeout into the aggregator stall deadline");
+  const env = streamEnv("65536");
+  env.STREAM_FETCH_TIMEOUT_MS = "500";
+  const prevFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    calls++;
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    if (calls === 1) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (!m) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    if (s === 0) return segSlice(s, e);
+    return new Response(new ReadableStream({
+      start(c) {},
+      cancel() {},
+    }), { status: 206, statusText: "Partial Content", headers: { "content-type": "audio/mpeg", "content-range": "bytes " + s + "-" + e + "/" + RANGE_BODY_400K.length, "content-length": String(e - s + 1) } });
+  };
+  try {
+    const start = 0, end = 131071;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    assert.equal(res.status, 206, "fan-out begins");
+    const t0 = Date.now();
+    await assert.rejects(() => res.text(), /stalled after 0 of 65536 bytes in segment 0/, "the planned segment stalls; the deadline must be the wired 500ms");
+    const elapsed = Date.now() - t0;
+    assert.ok(calls >= 2, "precondition: fan-out must have issued the initial + segment requests, got " + calls);
+    assert.ok(elapsed < 1400, "STREAM_FETCH_TIMEOUT_MS=500 must set the body-phase stall deadline; the hardcoded 1500 starts its clock strictly after t0 (the segment pump only launches on the consumer's first pull), so the old build breaches 1400 deterministically, took " + elapsed + "ms");
+  } finally { globalThis.fetch = prevFetch; }
+});
+
+test("H1 probe backoff: a 429 first-segment probe must be retried after an exponential pause, never hammered immediately", async () => {
+  const env = streamEnv("65536");
+  env.STREAM_SEGMENT_RETRY_BASE_MS = "40";
+  const prevFetch = globalThis.fetch;
+  const stamps = [];
+  let calls = 0;
+  globalThis.fetch = async (input, init) => {
+    calls++;
+    stamps.push(Date.now());
+    const h = init && init.headers ? Object.fromEntries(new Headers(init.headers).entries()) : {};
+    const m = /^bytes=(\d+)-(\d+)$/.exec(h.range || "");
+    if (calls === 1) return new Response(RANGE_BODY_400K, { status: 200, statusText: "OK", headers: { "content-type": "audio/mpeg", "content-length": String(RANGE_BODY_400K.length) } });
+    if (calls === 2) return new Response("", { status: 429, statusText: "Too Many Requests", headers: { "content-length": "0" } });
+    const s = parseInt(m[1], 10), e = parseInt(m[2], 10);
+    return segSlice(s, e);
+  };
+  try {
+    const start = 0, end = 131071;
+    const res = await worker.fetch(makeRequest({ method: "GET", url: STREAM_URL, headers: { range: "bytes=" + start + "-" + end } }), env);
+    assert.equal(res.status, 206, "fan-out must still answer 206 after a backed-off probe retry");
+    const body = await res.text();
+    assert.equal(body, RANGE_BODY_400K.slice(start, end + 1), "bytes must stay byte-exact through the retry");
+    assert.equal(calls, 4, "exactly initial + 429 probe + backed-off honest probe + one planned segment, got " + calls);
+    const gap = stamps[2] - stamps[1];
+    assert.ok(gap >= 35, "the retry after a 429 probe must wait the configured 40ms backoff, observed gap " + gap + "ms");
+  } finally { globalThis.fetch = prevFetch; }
+});

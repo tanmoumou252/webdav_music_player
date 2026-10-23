@@ -44,9 +44,41 @@ export default {
     }
 
     if (url.pathname === "/js/jsmediatags.min.js") {
+      let kvBody = null;
       try {
-        const cdnRes = await fetch("https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js");
+        kvBody = await env.MUSIC_KV.get("jsmediatags_3_9_5");
+      } catch (kvErr) {
+        kvBody = null;
+      }
+      if (kvBody) {
+        return new Response(kvBody, {
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/javascript; charset=utf-8",
+            "Cache-Control": "public, max-age=604800"
+          }
+        });
+      }
+      try {
+        const cdnTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+        const cdnAbort = new AbortController();
+        const cdnTimer = setTimeout(() => cdnAbort.abort(), cdnTimeoutMs);
+        let cdnRes;
+        try {
+          cdnRes = await fetch("https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js", { signal: cdnAbort.signal });
+        } finally {
+          clearTimeout(cdnTimer);
+        }
+        if (!cdnRes.ok) {
+          try { if (cdnRes.body) cdnRes.body.cancel(); } catch (cancelErr) {}
+          return new Response("// jsmediatags unavailable", {
+            headers: { ...corsHeaders, "Content-Type": "application/javascript" }
+          });
+        }
         const body = await cdnRes.text();
+        try {
+          await env.MUSIC_KV.put("jsmediatags_3_9_5", body, { expirationTtl: 604800 });
+        } catch (putErr) {}
         return new Response(body, {
           headers: {
             ...corsHeaders,
@@ -280,7 +312,7 @@ export default {
           const songMap = new Map();
 
           for (const src of sources) {
-            const res = await fetchWebDavList(src);
+            const res = await fetchWebDavList(src, env);
             debugLogs.push(res.debug);
 
             if (res.diagnostic) diagnosticErrors.push(res.diagnostic);
@@ -314,7 +346,7 @@ export default {
             }), { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
           }
 
-          const res = await fetchWebDavList(src);
+          const res = await fetchWebDavList(src, env);
           const singleMap = new Map();
           (res.items || []).forEach(i => {
             const normKey = normalizeSongKey(i.name);
@@ -424,9 +456,10 @@ export default {
         forwardHeaders.set("Authorization", "Basic " + btoa(unescape(encodeURIComponent(`${src.user || ""}:${src.pass || ""}`))));
       }
 
-      const clientRange = parseSingleByteRange(request.headers.get("Range"));
-      if (clientRange) {
-        forwardHeaders.set("Range", request.headers.get("Range"));
+      const rawClientRange = request.headers.get("Range");
+      const clientRange = parseSingleByteRange(rawClientRange);
+      if (rawClientRange) {
+        forwardHeaders.set("Range", rawClientRange);
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
@@ -435,11 +468,26 @@ export default {
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
+      const upstreamTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+      const upstreamAbort = new AbortController();
       try {
-        const res = await fetch(targetUrl, {
-          method: isHead ? "GET" : request.method,
-          headers: forwardHeaders
-        });
+        if (request.signal) {
+          if (request.signal.aborted) upstreamAbort.abort();
+          else request.signal.addEventListener("abort", () => upstreamAbort.abort(), { once: true });
+        }
+      } catch (sigErr) {}
+      const upstreamTimer = setTimeout(() => upstreamAbort.abort(), upstreamTimeoutMs);
+      let res;
+      try {
+        try {
+          res = await fetch(targetUrl, {
+            method: isHead ? "GET" : request.method,
+            headers: forwardHeaders,
+            signal: upstreamAbort.signal
+          });
+        } finally {
+          clearTimeout(upstreamTimer);
+        }
 
         if (isHead && (res.ok || res.status === 206 || res.status === 416)) {
           let headTotal = parseContentRangeTotal(res.headers.get("Content-Range"));
@@ -523,6 +571,212 @@ export default {
           }
           const rangeEnd = clientRange.end !== null ? Math.min(clientRange.end, upstreamTotal - 1) : upstreamTotal - 1;
           const rangeCount = rangeEnd - clientStart + 1;
+          const segConcurrency = parseSegmentConcurrency(env && env.STREAM_SEGMENT_CONCURRENCY);
+          let segPartSize = parseSegmentPartSize(env && env.STREAM_SEGMENT_PART_SIZE);
+          const segMaxSegments = parseSegmentMaxSegments(env && env.STREAM_SEGMENT_MAX_SEGMENTS);
+          const segMergeBytes = parseSegmentMergeBytes(env && env.STREAM_SEGMENT_MERGE_BYTES);
+          const segRetryBaseMs = parseSegmentRetryBaseMs(env && env.STREAM_SEGMENT_RETRY_BASE_MS);
+          let segCount = rangeCount > segPartSize ? Math.ceil(rangeCount / segPartSize) : 0;
+          if (segCount > segMaxSegments) {
+            segCount = segMaxSegments;
+            segPartSize = Math.ceil(rangeCount / segCount);
+          }
+          if (segCount > 0 && segPartSize <= SEGMENT_PART_SIZE_MAX) {
+            const firstRangeStart = clientStart;
+            const fanoutAbort = new AbortController();
+            try {
+              if (request.signal) {
+                if (request.signal.aborted) fanoutAbort.abort();
+                else request.signal.addEventListener("abort", () => fanoutAbort.abort(), { once: true });
+              }
+            } catch (sigErr) {}
+            const firstSegEnd = Math.min(firstRangeStart + segPartSize - 1, rangeEnd);
+            const firstSegHeaders = new Headers(forwardHeaders);
+            firstSegHeaders.set("Range", "bytes=" + firstRangeStart + "-" + firstSegEnd);
+            let firstSegRes = null;
+            let probeErr = null;
+            for (let probeAttempt = 0; probeAttempt < 3; probeAttempt++) {
+              const probeAbort = new AbortController();
+              try {
+                if (request.signal) {
+                  if (request.signal.aborted) probeAbort.abort();
+                  else request.signal.addEventListener("abort", () => probeAbort.abort(), { once: true });
+                }
+              } catch (probeSigErr) {}
+              const probeTimer = setTimeout(() => probeAbort.abort(), upstreamTimeoutMs);
+              try {
+                firstSegRes = await fetch(targetUrl, {
+                  method: "GET",
+                  headers: firstSegHeaders,
+                  signal: probeAbort.signal
+                });
+                if (firstSegRes.status === 206 && firstSegRes.body) break;
+                if (firstSegRes.status !== 206) {
+                  const retryableProbe = firstSegRes.status === 429 || firstSegRes.status >= 500;
+                  if (!retryableProbe || fanoutAbort.signal.aborted) break;
+                  try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
+                  firstSegRes = null;
+                  if (probeAttempt === 2) break;
+                  await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                  if (fanoutAbort.signal.aborted) break;
+                }
+              } catch (probeFetchErr) {
+                if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
+                if (probeAttempt === 2) break;
+                firstSegRes = null;
+                await new Promise((resolveSleep) => { setTimeout(resolveSleep, segmentRetryDelayMs(probeAttempt, segRetryBaseMs)); });
+                if (fanoutAbort.signal.aborted) { probeErr = probeFetchErr; break; }
+              } finally {
+                clearTimeout(probeTimer);
+              }
+            }
+            if (probeErr) {
+              try { if (res.body) res.body.cancel(); } catch (cancelErr) {}
+              throw probeErr;
+            }
+            if (firstSegRes && firstSegRes.status === 206 && !probeContentRangeOk(firstSegRes.headers.get("Content-Range"), firstRangeStart, firstSegEnd)) {
+              try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
+              firstSegRes = null;
+            }
+            if (!firstSegRes || firstSegRes.status !== 206 || !firstSegRes.body || res.headers.get("Content-Encoding")) {
+              if (firstSegRes) {
+                try { if (firstSegRes.body) firstSegRes.body.cancel(); } catch (cancelErr) {}
+              }
+              const reSliced = sliceReadableStream(res.body, clientStart, rangeCount);
+              if (reSliced) {
+                respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+                respHeaders.set("Content-Length", String(rangeCount));
+                respHeaders.set("Accept-Ranges", "bytes");
+                return new Response(reSliced, { status: 206, statusText: "Partial Content", headers: respHeaders });
+              }
+              respHeaders.delete("Accept-Ranges");
+              return new Response(res.body, { status: res.status, statusText: res.statusText, headers: respHeaders });
+            }
+            const planned = [];
+            let segStart = firstRangeStart + segPartSize;
+            while (segStart <= rangeEnd) {
+              const segEnd = Math.min(segStart + segPartSize - 1, rangeEnd);
+              planned.push({ start: segStart, end: segEnd });
+              segStart = segEnd + 1;
+            }
+            const segFetch = async (idx) => {
+              const spec = planned[idx];
+              const segHeaders = new Headers(forwardHeaders);
+              segHeaders.set("Range", "bytes=" + spec.start + "-" + spec.end);
+              const segAbort = new AbortController();
+              let segTimer = null;
+              try {
+                if (request.signal) {
+                  if (request.signal.aborted) segAbort.abort();
+                  else request.signal.addEventListener("abort", () => segAbort.abort(), { once: true });
+                }
+              } catch (sigErr) {}
+              let segRes;
+              try {
+                try {
+                  segTimer = setTimeout(() => segAbort.abort(), upstreamTimeoutMs);
+                  segRes = await fetch(targetUrl, { method: "GET", headers: segHeaders, signal: segAbort.signal });
+                } finally {
+                  clearTimeout(segTimer);
+                }
+              } catch (segErr) {
+                return { status: 0, stream: null };
+              }
+              return { status: segRes.status, stream: segRes.body };
+            };
+            const segments = planned.map((spec) => spec.end - spec.start + 1);
+            const agg = aggregateSegmentedStream(segFetch, segments, {
+              concurrency: segConcurrency,
+              mergeBytes: segMergeBytes,
+              segmentRetryBaseMs: segRetryBaseMs,
+              stallDeadlineMs: upstreamTimeoutMs
+            });
+            if (!agg) {
+              const reSliced = sliceReadableStream(res.body, clientStart, rangeCount);
+              if (reSliced) {
+                respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+                respHeaders.set("Content-Length", String(rangeCount));
+                respHeaders.set("Accept-Ranges", "bytes");
+                return new Response(reSliced, { status: 206, statusText: "Partial Content", headers: respHeaders });
+              }
+              respHeaders.delete("Accept-Ranges");
+              return new Response(res.body, { status: res.status, statusText: res.statusText, headers: respHeaders });
+            }
+            try { if (res.body) res.body.cancel(); } catch (cancelErr) {}
+            const firstBodyLen = Math.min(segPartSize, rangeCount);
+            const bridged = new ReadableStream({
+              start(c) {
+                const reader = firstSegRes.body.getReader();
+                let sent = 0;
+                const pump = async () => {
+                  try {
+                    for (;;) {
+                      const chunk = await reader.read();
+                      if (chunk.done) {
+                        if (sent < firstBodyLen) {
+                          c.error(new Error("first segment body ended after " + sent + " of " + firstBodyLen + " bytes"));
+                          return;
+                        }
+                        c.close();
+                        return;
+                      }
+                      if (sent + chunk.value.byteLength > firstBodyLen) {
+                        const remain = firstBodyLen - sent;
+                        if (remain > 0) c.enqueue(chunk.value.subarray(0, remain));
+                        sent = firstBodyLen;
+                        try { await reader.cancel(); } catch (cancelErr) {}
+                        c.close();
+                        return;
+                      }
+                      sent += chunk.value.byteLength;
+                      c.enqueue(chunk.value);
+                      if (sent >= firstBodyLen) {
+                        try { await reader.cancel(); } catch (cancelErr) {}
+                        c.close();
+                        return;
+                      }
+                    }
+                  } catch (e) {
+                    c.error(e);
+                  }
+                };
+                pump();
+              }
+            });
+            const joined = new ReadableStream({
+              async pull(controller) {
+                try {
+                  const chunk = await bridgeReader.read();
+                  if (!chunk.done) {
+                    controller.enqueue(chunk.value);
+                    return;
+                  }
+                  const achunk = await aggReader.read();
+                  if (!achunk.done) {
+                    controller.enqueue(achunk.value);
+                    return;
+                  }
+                  controller.close();
+                } catch (e) {
+                  try { bridgeReader.cancel(e).catch(() => {}); } catch (cErr) {}
+                  try { aggReader.cancel(e).catch(() => {}); } catch (cErr) {}
+                  controller.error(e);
+                }
+              },
+              cancel(reason) {
+                try { bridgeReader.cancel(reason); } catch (cErr) {}
+                try { aggReader.cancel(reason); } catch (cErr) {}
+              }
+            });
+            const bridgeReader = bridged.getReader();
+            const aggReader = agg.getReader();
+            respHeaders.delete("Content-Range");
+            respHeaders.delete("Content-Length");
+            respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
+            respHeaders.set("Content-Length", String(rangeCount));
+            respHeaders.set("Accept-Ranges", "bytes");
+            return new Response(joined, { status: 206, statusText: "Partial Content", headers: respHeaders });
+          }
           const sliced = sliceReadableStream(res.body, clientStart, rangeCount);
           if (sliced) {
             respHeaders.set("Content-Range", "bytes " + clientStart + "-" + rangeEnd + "/" + upstreamTotal);
@@ -548,15 +802,16 @@ export default {
           headers: respHeaders
         });
       } catch (networkErr) {
-        const diag = generateDiagnostic(0, networkErr.message, targetUrl, request.method, src.name, "");
+        const isAbort = networkErr && networkErr.name === "AbortError";
+        const diag = generateDiagnostic(isAbort ? 504 : 0, networkErr.message, targetUrl, request.method, src.name, "");
         if (await requireAdminSafe()) {
           return new Response(JSON.stringify({ error: diag.title, diagnostic: diag }), {
-            status: 502,
+            status: isAbort ? 504 : 502,
             headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
           });
         }
-        return new Response(JSON.stringify({ error: "无法连通源站", diagnostic: null }), {
-          status: 502,
+        return new Response(JSON.stringify({ error: isAbort ? "源站响应超时" : "无法连通源站", diagnostic: null }), {
+          status: isAbort ? 504 : 502,
           headers: { ...corsHeaders, "Content-Type": "application/json; charset=utf-8" }
         });
       }
@@ -959,11 +1214,96 @@ function parseContentRangeTotal(value) {
   return Number.isFinite(total) && total >= 0 ? total : null;
 }
 
+function parseUpstreamTimeoutMs(raw) {
+  const FALLBACK = 8000;
+  const MIN = 500;
+  const MAX = 300000;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentConcurrency(raw) {
+  const FALLBACK = 3;
+  const MIN = 1;
+  const MAX = 8;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+const SEGMENT_PART_SIZE_MAX = 8388608;
+
+function parseSegmentPartSize(raw) {
+  const FALLBACK = 1048576;
+  const MIN = 65536;
+  const MAX = SEGMENT_PART_SIZE_MAX;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentMaxSegments(raw) {
+  const FALLBACK = 16;
+  const MIN = 1;
+  const MAX = 64;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function parseSegmentMergeBytes(raw) {
+  const FALLBACK = 32768;
+  const MIN = 8192;
+  const MAX = 1048576;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (n < MIN) return MIN;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+const SEGMENT_RETRY_BASE_MS = 250;
+
+function segmentRetryDelayMs(attempt, baseMs) {
+  const base = baseMs >= 0 ? baseMs : SEGMENT_RETRY_BASE_MS;
+  return base * Math.pow(2, attempt);
+}
+
+function parseSegmentRetryBaseMs(raw) {
+  const FALLBACK = SEGMENT_RETRY_BASE_MS;
+  const MAX = 10000;
+  const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
+  if (!Number.isFinite(n) || n < 0) return FALLBACK;
+  if (n > MAX) return MAX;
+  return n;
+}
+
+function probeContentRangeOk(rawHeader, wantStart, wantEnd) {
+  if (typeof rawHeader !== "string") return false;
+  const m = /^bytes\s+(\d+)-(\d+)\/(?:\d+|\*)$/i.exec(rawHeader.trim());
+  if (!m) return false;
+  const s = parseInt(m[1], 10);
+  const e = parseInt(m[2], 10);
+  if (!Number.isFinite(s) || !Number.isFinite(e)) return false;
+  return s === wantStart && e === wantEnd;
+}
+
 function sliceReadableStream(stream, start, count) {
   if (!stream || !(count > 0)) return null;
   const reader = stream.getReader();
   let skipped = 0;
   let sent = 0;
+  const FLUSH_BYTES = 32768;
+  let pending = null;
   return new ReadableStream({
     async pull(controller) {
       try {
@@ -991,6 +1331,30 @@ function sliceReadableStream(stream, start, count) {
             value = value.subarray(0, count - sent);
           }
           sent += value.byteLength;
+          if (pending && pending.byteLength + value.byteLength <= FLUSH_BYTES) {
+            const merged = new Uint8Array(pending.byteLength + value.byteLength);
+            merged.set(pending, 0);
+            merged.set(value, pending.byteLength);
+            pending = merged;
+            if (sent < count) continue;
+            controller.enqueue(pending);
+            pending = null;
+            controller.close();
+            reader.cancel().catch(() => {});
+            return;
+          }
+          if (pending) {
+            controller.enqueue(pending);
+            pending = null;
+            if (value.byteLength < FLUSH_BYTES && sent < count) {
+              pending = value;
+              return;
+            }
+          }
+          if (value.byteLength < FLUSH_BYTES && sent < count) {
+            pending = value;
+            continue;
+          }
           controller.enqueue(value);
           if (sent >= count) {
             controller.close();
@@ -1009,7 +1373,241 @@ function sliceReadableStream(stream, start, count) {
   });
 }
 
-async function fetchWebDavList(src) {
+function aggregateSegmentedStream(segFetch, segments, options) {
+  if (typeof segFetch !== "function") return null;
+  if (typeof segments === "number") segments = new Array(segments).fill(null);
+  if (!Array.isArray(segments) || segments.length === 0) return null;
+  const opts = options || {};
+  const concurrency = opts.concurrency > 0 ? opts.concurrency : 3;
+  const mergeBytes = opts.mergeBytes > 0 ? opts.mergeBytes : 32768;
+  const retryBaseMs = typeof opts.segmentRetryBaseMs === "number" && opts.segmentRetryBaseMs >= 0 ? opts.segmentRetryBaseMs : SEGMENT_RETRY_BASE_MS;
+  const retrySleep = typeof opts.retrySleep === "function" ? opts.retrySleep : (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+  const MERGE_STALL_MS = 40;
+  const STALL_DEADLINE_MS = opts.stallDeadlineMs > 0 ? opts.stallDeadlineMs : parseUpstreamTimeoutMs(undefined);
+  const STALL = Symbol("stall");
+  let failed = null;
+  let cancelRequested = false;
+  const readers = new Map();
+  const queues = new Map();
+  const pendingSeg = new Map();
+  const inFlight = new Set();
+  let consumeIndex = 0;
+  const waiters = new Set();
+  const notify = () => {
+    const list = [...waiters];
+    waiters.clear();
+    for (const w of list) { try { w(); } catch (wErr) {} }
+  };
+
+  function fail(e) {
+    if (failed) return;
+    failed = e;
+    for (const r of readers.values()) { try { r.cancel(); } catch (cErr) {} }
+    readers.clear();
+    for (const q of queues.values()) q.length = 0;
+    queues.clear();
+    pendingSeg.clear();
+    notify();
+  }
+
+  async function pump(i, reader) {
+    try {
+      let got = 0;
+      let pendingRead = reader.read();
+      let lastProgressAt = Date.now();
+      for (;;) {
+        if (cancelRequested || failed) return;
+        let stallTimer = null;
+        const raced = await Promise.race([pendingRead, new Promise((resolve) => { stallTimer = setTimeout(() => resolve(STALL), MERGE_STALL_MS); })]);
+        if (raced === STALL) {
+          const pend = pendingSeg.get(i);
+          if (!pend || pend.byteLength === 0) {
+            if (Date.now() - lastProgressAt < STALL_DEADLINE_MS) continue;
+            const declaredIdle = typeof segments[i] === "number" ? segments[i] : null;
+            if (declaredIdle !== null && got < declaredIdle) {
+              fail(new Error("upstream body stalled after " + got + " of " + declaredIdle + " bytes in segment " + i));
+              return;
+            }
+            const qi = queues.get(i) || [];
+            qi.push({ done: true });
+            queues.set(i, qi);
+            try { await reader.cancel(); } catch (cErr) {}
+            notify();
+            return;
+          }
+          const qs = queues.get(i) || [];
+          qs.push({ value: pend });
+          pendingSeg.delete(i);
+          queues.set(i, qs);
+          notify();
+          continue;
+        }
+        if (stallTimer) clearTimeout(stallTimer);
+        lastProgressAt = Date.now();
+        const chunk = raced;
+        if (chunk.done) {
+          const declared = typeof segments[i] === "number" ? segments[i] : null;
+          if (declared !== null && got < declared) {
+            fail(new Error("upstream body ended after " + got + " of " + declared + " bytes in segment " + i));
+            return;
+          }
+          const q = queues.get(i) || [];
+          const pendDone = pendingSeg.get(i);
+          if (pendDone) { q.push({ value: pendDone }); pendingSeg.delete(i); }
+          q.push({ done: true });
+          queues.set(i, q);
+          notify();
+          return;
+        }
+        got += chunk.value.byteLength;
+        const declared = typeof segments[i] === "number" ? segments[i] : null;
+        let value = chunk.value;
+        if (declared !== null && got > declared) {
+          value = value.subarray(0, value.byteLength - (got - declared));
+        }
+        const q = queues.get(i) || [];
+        if (value.byteLength > 0) {
+          const pend = pendingSeg.get(i);
+          if (pend && pend.byteLength + value.byteLength <= mergeBytes) {
+            const merged = new Uint8Array(pend.byteLength + value.byteLength);
+            merged.set(pend, 0);
+            merged.set(value, pend.byteLength);
+            pendingSeg.set(i, merged);
+          } else {
+            if (pend) { q.push({ value: pend }); pendingSeg.delete(i); }
+            if (value.byteLength < mergeBytes && (declared === null || got < declared)) pendingSeg.set(i, value);
+            else q.push({ value });
+          }
+        }
+        queues.set(i, q);
+        notify();
+        if (declared !== null && got >= declared) {
+          const q2 = queues.get(i);
+          const pendFull = pendingSeg.get(i);
+          if (pendFull) { q2.push({ value: pendFull }); pendingSeg.delete(i); }
+          q2.push({ done: true });
+          try { await reader.cancel(); } catch (cErr) {}
+          notify();
+          return;
+        }
+        while (!cancelRequested && !failed && i !== consumeIndex && i !== consumeIndex + 1) {
+          await new Promise((resolve) => { waiters.add(resolve); });
+        }
+        if (cancelRequested || failed) return;
+        pendingRead = reader.read();
+      }
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function launch(i) {
+    inFlight.add(i);
+    try {
+      for (let attempt = 0; ; attempt++) {
+        if (cancelRequested || failed) return;
+        let res = null;
+        try {
+          res = await segFetch(i);
+        } catch (fetchErr) {
+          if (attempt >= 2 || cancelRequested || failed) {
+            fail(fetchErr);
+            return;
+          }
+          await retrySleep(segmentRetryDelayMs(attempt, retryBaseMs));
+          if (cancelRequested || failed) return;
+          continue;
+        }
+        if (res && res.status === 206 && res.stream) {
+          const reader = res.stream.getReader();
+          readers.set(i, reader);
+          await pump(i, reader);
+          if (failed || cancelRequested) {
+            try { await reader.cancel(); } catch (cErr) {}
+          }
+          return;
+        }
+        const retryable = res && (res.status === 0 || res.status === 429 || res.status >= 500);
+        if (!retryable || attempt >= 2 || cancelRequested || failed) {
+          fail(new Error("segment " + i + " headers-phase failure with status " + (res ? res.status : "no-response") + (retryable ? " (retries exhausted)" : " (terminal, no retry)")));
+          return;
+        }
+        if (res && res.stream) { try { res.stream.cancel().catch(() => {}); } catch (cErr) {} }
+        await retrySleep(segmentRetryDelayMs(attempt, retryBaseMs));
+        if (cancelRequested || failed) return;
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      inFlight.delete(i);
+      notify();
+    }
+  }
+
+  function requestMore(upTo) {
+    for (let i = nextLaunch; i < upTo && !failed && !cancelRequested; i++) {
+      if (!readers.has(i) && !inFlight.has(i)) {
+        nextLaunch = i + 1;
+        launch(i);
+      }
+    }
+  }
+
+  let nextLaunch = 0;
+
+  return new ReadableStream({
+    async pull(controller) {
+      try {
+        for (;;) {
+          if (failed) throw failed;
+          for (let i = consumeIndex; i < segments.length; i++) {
+            requestMore(Math.min(i + concurrency, segments.length));
+            const q = queues.get(i);
+            if (q && q.length) {
+              const item = q.shift();
+              if (item.done) {
+                queues.delete(i);
+                readers.delete(i);
+                consumeIndex = i + 1;
+                notify();
+                continue;
+              }
+              controller.enqueue(item.value);
+              return;
+            }
+            if (readers.has(i) || inFlight.has(i)) {
+              await new Promise((resolve) => { waiters.add(resolve); });
+              break;
+            }
+            if (failed) throw failed;
+          }
+          if (failed) throw failed;
+          let anyPending = false;
+          for (let i = consumeIndex; i < segments.length; i++) {
+            if (queues.has(i) || readers.has(i) || inFlight.has(i)) { anyPending = true; break; }
+          }
+          if (!anyPending) {
+            controller.close();
+            return;
+          }
+        }
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      cancelRequested = true;
+      for (const r of readers.values()) { try { r.cancel(reason); } catch (cErr) {} }
+      readers.clear();
+      for (const q of queues.values()) q.length = 0;
+      queues.clear();
+      pendingSeg.clear();
+      notify();
+    }
+  });
+}
+
+async function fetchWebDavList(src, env) {
   let targetUrl = src.url.endsWith("/") ? src.url : src.url + "/";
 
   const headers = new Headers({ "Depth": "1" });
@@ -1018,8 +1616,15 @@ async function fetchWebDavList(src) {
   }
 
   let davRes;
+  const listTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+  const listAbort = new AbortController();
+  const listTimer = setTimeout(() => listAbort.abort(), listTimeoutMs);
   try {
-    davRes = await fetch(targetUrl, { method: "PROPFIND", headers });
+    try {
+      davRes = await fetch(targetUrl, { method: "PROPFIND", headers, signal: listAbort.signal });
+    } finally {
+      clearTimeout(listTimer);
+    }
   } catch (e) {
     const diag = generateDiagnostic(0, e.message, targetUrl, "PROPFIND", src.name);
     return {
@@ -1307,7 +1912,9 @@ function renderHTML() {
     
     .timeline-wrap { display: flex; align-items: center; width: 100%; gap: 10px; font-size: 0.75rem; color: var(--sub); }
     .progress-bar { flex: 1 1 auto; width: 100%; height: 5px; background: var(--border); border-radius: 3px; position: relative; cursor: pointer; }
-    .progress-fill { height: 100%; background: var(--accent); border-radius: 3px; width: 0%; pointer-events: none; }
+    .progress-buffered { position: absolute; top: 0; height: 100%; background: rgba(255, 255, 255, 0.25); border-radius: 3px; width: 0%; pointer-events: none; }
+    .progress-fill { position: relative; height: 100%; background: var(--accent); border-radius: 3px; width: 0%; pointer-events: none; }
+    .progress-bar.is-seeking { opacity: 0.5; }
 
     .source-card { border: 1px solid var(--border); border-radius: var(--radius-card); margin-bottom: 10px; background: var(--card); overflow: hidden; box-shadow: var(--shadow-card); }
     .source-card-header { padding: 10px 14px; background: var(--card-subtle); display: flex; align-items: center; justify-content: space-between; cursor: pointer; -webkit-user-select: none; user-select: none; }
@@ -1328,6 +1935,11 @@ function renderHTML() {
     .input-row input { width: 100%; background: var(--bg); border: 1px solid var(--border); padding: 8px 10px; border-radius: 6px; color: #fff; outline: none; }
     .del-btn { background: none; border: none; color: var(--danger); cursor: pointer; padding: 4px; border-radius: 4px; display: flex; align-items: center; }
     .del-btn:hover { background: var(--danger-bg-faint); }
+    .drag-handle { background: none; border: none; color: var(--sub); cursor: grab; padding: 4px; border-radius: 4px; display: flex; align-items: center; touch-action: none; -webkit-tap-highlight-color: transparent; }
+    .drag-handle:hover { color: var(--accent); background: var(--card-subtle); }
+    .drag-handle:active { cursor: grabbing; }
+    .source-card.dragging { opacity: 0.45; }
+    .drag-indicator-line { height: 2px; background: var(--accent); margin: -1px 0; border-radius: 1px; pointer-events: none; }
 
     #diag-modal .modal-box { width: min(580px, 92vw); }
     .diag-item { margin-bottom: 12px; font-size: 0.88rem; }
@@ -1551,6 +2163,7 @@ function renderHTML() {
     <symbol id="icon-volume-off" viewBox="0 0 24 24"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></symbol>
     <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></symbol>
     <symbol id="icon-queue-music" viewBox="0 0 24 24"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18c-.31-.11-.65-.18-1-.18-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3V8h3V6h-5z"/></symbol>
+    <symbol id="icon-drag-indicator" viewBox="0 -960 960 960"><path d="M360-160q-33 0-56.5-23.5T280-240q0-33 23.5-56.5T360-320q33 0 56.5 23.5T440-240q0 33-23.5 56.5T360-160Zm240 0q-33 0-56.5-23.5T520-240q0-33 23.5-56.5T600-320q33 0 56.5 23.5T680-240q0 33-23.5 56.5T600-160ZM360-400q-33 0-56.5-23.5T280-480q0-33 23.5-56.5T360-560q33 0 56.5 23.5T440-480q0 33-23.5 56.5T360-400Zm240 0q-33 0-56.5-23.5T520-480q0-33 23.5-56.5T600-560q33 0 56.5 23.5T680-480q0 33-23.5 56.5T600-400ZM360-640q-33 0-56.5-23.5T280-720q0-33 23.5-56.5T360-800q33 0 56.5 23.5T440-720q0 33-23.5 56.5T360-640Zm240 0q-33 0-56.5-23.5T520-720q0-33 23.5-56.5T600-800q33 0 56.5 23.5T680-720q0 33-23.5 56.5T600-640Z"/></symbol>
   </svg>
 
   <div id="sidebar-backdrop" onclick="closePlaylistDrawer()" aria-hidden="true"></div>
@@ -1650,6 +2263,7 @@ function renderHTML() {
         <div class="timeline-wrap">
           <span id="time-current">00:00</span>
           <div class="progress-bar" id="progress-bar" onclick="seekAudio(event)">
+            <div class="progress-buffered" id="progress-buffered"></div>
             <div class="progress-fill" id="progress-fill"></div>
           </div>
           <span id="time-duration">00:00</span>
@@ -1689,7 +2303,7 @@ function renderHTML() {
       </button>
     </div>
   </div>
-  <audio id="audio" preload="metadata"></audio>
+  <audio id="audio" preload="auto"></audio>
 
   <div class="modal" id="init-modal">
     <div class="modal-box">
@@ -1935,6 +2549,60 @@ function renderHTML() {
     const TAG_CACHE_MAX = 24;
     const PROGRESS_STORE_KEY = 'webdav_player_progress_v1';
     const PROGRESS_TTL_MS = 21600000;
+    const NODE_HEALTH_STORE_KEY = 'webdav_player_node_health_v1';
+    const NODE_HEALTH_TTL_MS = 86400000;
+    const NODE_HEALTH_MAX_ENTRIES = 64;
+
+    function readNodeHealth() {
+      try {
+        const raw = localStorage.getItem(NODE_HEALTH_STORE_KEY);
+        if (!raw) return {};
+        const rec = JSON.parse(raw);
+        if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return {};
+        const now = Date.now();
+        const out = {};
+        let count = 0;
+        for (const k of Object.keys(rec)) {
+          const until = rec[k];
+          if (typeof until === 'number' && isFinite(until) && until > now && count < NODE_HEALTH_MAX_ENTRIES) {
+            out[k] = until;
+            count = count + 1;
+          }
+        }
+        return out;
+      } catch (e) {
+        return {};
+      }
+    }
+
+    function writeNodeHealth(map) {
+      try {
+        localStorage.setItem(NODE_HEALTH_STORE_KEY, JSON.stringify(map));
+      } catch (e) {}
+    }
+
+    function markNodeBad(sourceId) {
+      if (!sourceId) return;
+      const map = readNodeHealth();
+      map[String(sourceId)] = Date.now() + NODE_HEALTH_TTL_MS;
+      writeNodeHealth(map);
+    }
+
+    function clearNodeBad(sourceId) {
+      if (!sourceId) return;
+      const map = readNodeHealth();
+      if (Object.prototype.hasOwnProperty.call(map, String(sourceId))) {
+        delete map[String(sourceId)];
+        writeNodeHealth(map);
+      }
+    }
+
+    function isNodeAvoidable(sourceId) {
+      if (!sourceId) return false;
+      const map = readNodeHealth();
+      const until = map[String(sourceId)];
+      return typeof until === 'number' && until > Date.now();
+    }
 
     function escapeHtml(s) {
       return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -2002,9 +2670,26 @@ function renderHTML() {
       }
     }
 
-    document.addEventListener('keydown', (event) => {
+    const OVERLAY_MODAL_IDS = ['paste-modal', 'app-dialog', 'pass-modal', 'admin-modal', 'diag-modal', 'init-modal'];
+
+    function handleGlobalKeydown(event) {
+      if (event.key === ' ') {
+        if (event.repeat) return;
+        const ae = document.activeElement;
+        const tag = ae && ae.tagName ? ae.tagName : '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON' || tag === 'A' || (ae && ae.isContentEditable)) return;
+        for (let i = 0; i < OVERLAY_MODAL_IDS.length; i++) {
+          const m = document.getElementById(OVERLAY_MODAL_IDS[i]);
+          if (m && m.classList.contains('show')) return;
+        }
+        const vp = document.getElementById('volume-popover');
+        if (vp && vp.classList.contains('show')) return;
+        event.preventDefault();
+        togglePlay();
+        return;
+      }
       if (event.key !== 'Escape') return;
-      const modalOrder = ['paste-modal', 'app-dialog', 'pass-modal', 'admin-modal', 'diag-modal', 'init-modal'];
+      const modalOrder = OVERLAY_MODAL_IDS;
       for (let i = 0; i < modalOrder.length; i++) {
         const modal = document.getElementById(modalOrder[i]);
         if (modal && modal.classList.contains('show')) {
@@ -2039,7 +2724,8 @@ function renderHTML() {
       if (sidebar && sidebar.classList.contains('drawer-open')) {
         closePlaylistDrawer();
       }
-    });
+    }
+    document.addEventListener('keydown', handleGlobalKeydown);
 
     function formatTime(sec) {
       if (isNaN(sec)) return "00:00";
@@ -2537,17 +3223,33 @@ function renderHTML() {
         window.history.replaceState(null, '', u.toString());
       }
 
+      retrySkippedNodes = null;
+      retryBypassOnce = false;
+      playingFromRetryQueue = false;
       tryPlayFromNode(song, nodeIndex, isAuto);
     }
 
+    var retrySkippedNodes = null;
+    var retryBypassOnce = false;
+    var playingFromRetryQueue = false;
+
     async function tryPlayFromNode(song, nodeIndex, isAuto = false) {
       const token = ++playToken;
+
+      if (song && song.availableNodes && nodeIndex >= song.availableNodes.length && retrySkippedNodes && retrySkippedNodes.length > 0) {
+        const nextRetryIdx = retrySkippedNodes.shift();
+        retryBypassOnce = true;
+        playingFromRetryQueue = true;
+        tryPlayFromNode(song, nextRetryIdx, isAuto);
+        return;
+      }
 
       if (!song.availableNodes || nodeIndex >= song.availableNodes.length) {
         if (token !== playToken) return;
         stopStallHeartbeat();
         stallRetries = 0;
         pendingSeek = null;
+        playingFromRetryQueue = false;
         reportDiagnostic({
           title: "所有 WebDAV 线路均尝试失败",
           sourceName: "全局容灾",
@@ -2560,13 +3262,25 @@ function renderHTML() {
         return;
       }
 
-      const node = song.availableNodes[nodeIndex];
+      let effectiveIndex = nodeIndex;
+      const bypassThisHop = retryBypassOnce;
+      retryBypassOnce = false;
+      if (!bypassThisHop && effectiveIndex < song.availableNodes.length - 1 && isNodeAvoidable(song.availableNodes[effectiveIndex].sourceId)) {
+        let probe = effectiveIndex;
+        if (!retrySkippedNodes) retrySkippedNodes = [];
+        while (probe < song.availableNodes.length - 1 && isNodeAvoidable(song.availableNodes[probe].sourceId)) {
+          if (retrySkippedNodes.indexOf(probe) === -1) retrySkippedNodes.push(probe);
+          probe = probe + 1;
+        }
+        effectiveIndex = probe;
+      }
+      const node = song.availableNodes[effectiveIndex];
       const totalInQueue = currentPlaylist.length > 0 ? (' (' + (currentIndex + 1) + '/' + currentPlaylist.length + ')') : '';
-      document.getElementById('info-node').textContent = '线路: ' + (nodeIndex + 1) + '/' + song.availableNodes.length + totalInQueue;
+      document.getElementById('info-node').textContent = '线路: ' + (effectiveIndex + 1) + '/' + song.availableNodes.length + totalInQueue;
 
       const streamUrl = '/api/stream?sourceId=' + encodeURIComponent(node.sourceId) + '&file=' + encodeURIComponent(node.href);
 
-      currentNodeIndex = nodeIndex;
+      currentNodeIndex = effectiveIndex;
       currentIsAuto = isAuto;
       if (pendingSeek === null) pendingSeek = lastKnownProgress(song);
 
@@ -2587,20 +3301,28 @@ function renderHTML() {
 
       audio.onerror = async () => {
         if (token !== playToken) return;
+        let originProbeFailed = false;
+        const probeAbort = new AbortController();
+        const probeTimer = setTimeout(() => probeAbort.abort(), 15000);
         try {
-          const check = await fetch(streamUrl, { headers: { 'Range': 'bytes=0-65535' } });
+          const check = await fetch(streamUrl, { headers: { 'Range': 'bytes=0-65535' }, signal: probeAbort.signal });
+          clearTimeout(probeTimer);
           if (token !== playToken) return;
           if (!check.ok) {
+            originProbeFailed = true;
             const errJson = await check.json().catch(() => ({}));
             if (errJson.diagnostic) reportDiagnostic(errJson.diagnostic, { quiet: isAuto ? true : false });
           }
         } catch(e) {
+          clearTimeout(probeTimer);
           if (token !== playToken) return;
+          originProbeFailed = true;
         }
         if (token !== playToken) return;
-        console.warn('节点 ' + (nodeIndex + 1) + ' 失败，尝试下一镜像...');
+        console.warn('节点 ' + (effectiveIndex + 1) + ' 失败，尝试下一镜像...');
+        if (originProbeFailed) markNodeBad(node.sourceId);
         pendingSeek = lastKnownProgress(song) || pendingSeek;
-        tryPlayFromNode(song, nodeIndex + 1, isAuto);
+        tryPlayFromNode(song, playingFromRetryQueue ? song.availableNodes.length : effectiveIndex + 1, isAuto);
       };
 
       const cachedTags = tagCache.get(songKey(song));
@@ -2626,6 +3348,8 @@ function renderHTML() {
           const restored = lastKnownProgress(currentSongRef);
           if (restored !== null) {
             pendingSeek = restored;
+            retrySkippedNodes = null;
+            playingFromRetryQueue = false;
             tryPlayFromNode(currentSongRef, currentNodeIndex, currentIsAuto);
             return;
           }
@@ -2696,12 +3420,50 @@ function renderHTML() {
       }
     };
 
+    function renderBufferedRanges() {
+      const el = document.getElementById('progress-buffered');
+      if (!el) return;
+      let left = 0;
+      let width = 0;
+      try {
+        if (audio.buffered && audio.buffered.length && audio.duration && isFinite(audio.duration) && audio.duration > 0) {
+          for (let i = 0; i < audio.buffered.length; i++) {
+            const s = audio.buffered.start(i);
+            const e2 = audio.buffered.end(i);
+            if (s <= audio.currentTime + 0.5 && e2 > audio.currentTime) {
+              left = (s / audio.duration) * 100;
+              width = ((e2 - s) / audio.duration) * 100;
+              break;
+            }
+          }
+          if (width === 0) {
+            const s = audio.buffered.start(0);
+            const e2 = audio.buffered.end(0);
+            left = (s / audio.duration) * 100;
+            width = ((e2 - s) / audio.duration) * 100;
+          }
+        }
+      } catch (rangeErr) { left = 0; width = 0; }
+      el.style.left = left + '%';
+      el.style.width = width + '%';
+    }
+
+    audio.onprogress = renderBufferedRanges;
+
+    audio.onseeked = () => {
+      const seekingBar = document.getElementById('progress-bar');
+      if (seekingBar) seekingBar.classList.remove('is-seeking');
+    };
+
     function seekAudio(e) {
       const bar = document.getElementById('progress-bar');
+      if (!bar || typeof bar.getBoundingClientRect !== 'function') return;
       const rect = bar.getBoundingClientRect();
-      const pct = (e.clientX - rect.left) / rect.width;
-      if (audio.duration) {
+      if (!rect || !rect.width) return;
+      const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      if (audio.duration && isFinite(audio.duration)) {
         audio.currentTime = pct * audio.duration;
+        bar.classList.add('is-seeking');
       }
     }
 
@@ -2721,6 +3483,7 @@ function renderHTML() {
         const pct = (audio.currentTime / audio.duration) * 100;
         document.getElementById('progress-fill').style.width = pct + '%';
       }
+      renderBufferedRanges();
 
       if (lrcData.length === 0) return;
 
@@ -2756,6 +3519,8 @@ function renderHTML() {
       pendingSeek = null;
       resetStallMarks();
       startStallHeartbeat();
+      const metaBar = document.getElementById('progress-bar');
+      if (metaBar) metaBar.classList.remove('is-seeking');
       if (pendingTag && pendingTag.token === playToken) {
         const job = pendingTag;
         pendingTag = null;
@@ -2905,15 +3670,20 @@ function renderHTML() {
         stallRetries = stallRetries + 1;
         console.warn('播放停滞，就地重连并回到上次进度（第 ' + stallRetries + ' 次）');
         showToast('网络抖动，正在恢复播放位置…');
-        pendingSeek = lastKnownProgress(song);
+        if (pendingSeek === null) {
+          const livePos = audio.currentTime;
+          pendingSeek = (isFinite(livePos) && livePos >= 3) ? livePos : lastKnownProgress(song);
+        }
         resetStallMarks();
         tryPlayFromNode(song, currentNodeIndex, currentIsAuto);
         return;
       }
       stallRetries = 0;
       console.warn('就地重连无效，切换下一镜像线路');
+      const abandoned = currentSongRef && currentSongRef.availableNodes ? currentSongRef.availableNodes[currentNodeIndex] : null;
+      if (abandoned) markNodeBad(abandoned.sourceId);
       resetStallMarks();
-      tryPlayFromNode(song, currentNodeIndex + 1, currentIsAuto);
+      tryPlayFromNode(song, playingFromRetryQueue ? song.availableNodes.length : currentNodeIndex + 1, currentIsAuto);
     }
 
     function normalizeTags(t) {
@@ -3040,8 +3810,12 @@ function renderHTML() {
     audio.onplaying = () => {
       waitingForGesture = false;
       externallyPaused = false;
+      const playingNode = currentSongRef && currentSongRef.availableNodes ? currentSongRef.availableNodes[currentNodeIndex] : null;
+      if (playingNode) clearNodeBad(playingNode.sourceId);
       resetStallMarks();
       startStallHeartbeat();
+      const playingBar = document.getElementById('progress-bar');
+      if (playingBar) playingBar.classList.remove('is-seeking');
     };
 
     audio.oncanplay = () => {
@@ -3137,22 +3911,36 @@ function renderHTML() {
       }
     }
 
+    let adminLoggingIn = false;
+
     async function loginAdmin() {
-      const pass = document.getElementById('login-admin-pass').value;
-      const res = await fetch('/api/admin/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminPass: pass })
-      });
-      if (res.ok) {
-        isAuthed = true;
-        showAdminContent();
-      } else {
-        let msg = '密码错误';
-        try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) {}
-        showAppDialog(msg);
+      if (adminLoggingIn) return;
+      adminLoggingIn = true;
+      try {
+        const pass = document.getElementById('login-admin-pass').value;
+        const res = await fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminPass: pass })
+        });
+        if (res.ok) {
+          isAuthed = true;
+          showAdminContent();
+        } else {
+          let msg = '密码错误';
+          try { const d = await res.json(); if (d && d.error) msg = d.error; } catch (e) {}
+          showAppDialog(msg);
+        }
+      } finally {
+        adminLoggingIn = false;
       }
     }
+
+    function handleLoginKeydown(e) {
+      if (e.key === 'Enter') loginAdmin();
+    }
+
+    document.getElementById('login-admin-pass').addEventListener('keydown', handleLoginKeydown);
 
     async function showAdminContent() {
       document.getElementById('admin-login-sec').style.display = 'none';
@@ -3166,6 +3954,7 @@ function renderHTML() {
       const container = document.getElementById('sources-container');
       container.innerHTML = '';
       sources.forEach((s, idx) => container.appendChild(createSourceCard(s, idx, false)));
+      bindDragHandles();
     }
 
     function createSourceCard(s = {}, idx = Date.now(), isOpen = false) {
@@ -3181,6 +3970,9 @@ function renderHTML() {
             <span class="source-name-badge">\${escapeHtml(sourceName)}</span>
             <span class="source-url-preview">\${escapeHtml(sourceUrl)}</span>
           </div>
+          <button type="button" class="drag-handle" title="拖拽排序" aria-label="拖拽排序">
+            <svg class="md-icon md-icon-sm"><use href="#icon-drag-indicator"/></svg>
+          </button>
           <button class="del-btn" onclick="event.stopPropagation(); deleteCard(this)" title="删除源">
             <svg class="md-icon md-icon-sm"><use href="#icon-delete"/></svg>
           </button>
@@ -3204,6 +3996,119 @@ function renderHTML() {
     function deleteCard(btnEl) {
       btnEl.closest('.source-card').remove();
     }
+
+    var dragState = null;
+
+    function getDragCardFromEvent(e) {
+      var handle = e.target && e.target.closest ? e.target.closest('.drag-handle') : null;
+      if (!handle) return null;
+      return handle.closest('.source-card');
+    }
+
+    function beginDrag(e) {
+      if (dragState) return;
+      var card = getDragCardFromEvent(e);
+      if (!card) return;
+      e.preventDefault();
+      e.stopPropagation();
+      var st = { pointerId: e.pointerId, card: card, started: false };
+      try {
+        e.target.setPointerCapture(e.pointerId);
+      } catch (err) {}
+      dragState = st;
+      window.addEventListener('pointermove', onDragMove);
+      window.addEventListener('pointerup', onDragEnd);
+      window.addEventListener('pointercancel', onDragCancel);
+    }
+
+    function resolveDropIndex(e) {
+      var container = document.getElementById('sources-container');
+      if (!container) return -1;
+      var cards = container.querySelectorAll('.source-card');
+      for (var i = 0; i < cards.length; i++) {
+        var r = cards[i].getBoundingClientRect();
+        if (e.clientY < r.top + r.height / 2) return i;
+      }
+      return cards.length;
+    }
+
+    function onDragMove(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      if (!dragState.started) {
+        dragState.started = true;
+        dragState.card.classList.add('dragging');
+      }
+      var container = document.getElementById('sources-container');
+      if (!container) return;
+      var idx = resolveDropIndex(e);
+      var line = container.querySelector('.drag-indicator-line');
+      if (idx < 0) {
+        if (line) line.remove();
+        return;
+      }
+      if (!line) {
+        line = document.createElement('div');
+        line.className = 'drag-indicator-line';
+      }
+      var cards = container.querySelectorAll('.source-card');
+      if (idx >= cards.length) {
+        container.appendChild(line);
+      } else {
+        container.insertBefore(line, cards[idx]);
+      }
+    }
+
+    function onDragEnd(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      finishDrag(e);
+    }
+
+    function onDragCancel(e) {
+      if (!dragState || e.pointerId !== dragState.pointerId) return;
+      finishDrag(e);
+    }
+
+    function finishDrag(e) {
+      var st = dragState;
+      if (!st) return;
+      dragState = null;
+      window.removeEventListener('pointermove', onDragMove);
+      window.removeEventListener('pointerup', onDragEnd);
+      window.removeEventListener('pointercancel', onDragCancel);
+      st.card.classList.remove('dragging');
+      var container = document.getElementById('sources-container');
+      var line = container ? container.querySelector('.drag-indicator-line') : null;
+      if (line) line.remove();
+      if (!e || !st.started || !container) return;
+      var idx = resolveDropIndex(e);
+      if (idx < 0) return;
+      var cards = container.querySelectorAll('.source-card');
+      var from = Array.prototype.indexOf.call(cards, st.card);
+      if (from === -1) return;
+      var target = st.card;
+      if (idx >= cards.length) {
+        var last = cards[cards.length - 1];
+        if (last !== st.card) target = null;
+      } else {
+        target = cards[idx];
+      }
+      if (target === st.card) return;
+      if (idx >= cards.length) {
+        container.appendChild(st.card);
+      } else {
+        container.insertBefore(st.card, target);
+      }
+    }
+
+    function bindDragHandles() {
+      var container = document.getElementById('sources-container');
+      if (!container || container.dataset.dragBound === '1') return;
+      container.dataset.dragBound = '1';
+      container.addEventListener('pointerdown', beginDrag);
+    }
+
+    window.addEventListener('blur', () => { if (dragState) finishDrag(null); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden && dragState) finishDrag(null); });
 
     function updateCardTitle(inputEl) {
       const badge = inputEl.closest('.source-card').querySelector('.source-name-badge');

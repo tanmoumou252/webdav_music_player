@@ -136,7 +136,12 @@ function runClient(scriptText, options = {}) {
     "armShareSeek: typeof pendingShareSeek !== 'undefined' ? (v) => { pendingShareSeek = v; } : null," +
     "seedShareSong: (song, time) => { currentPlaylist = [song]; currentIndex = 0; audio.currentTime = time; }," +
     "copyShareUrl: () => copyCurrentSongShareUrl()," +
-    "tryPlayFromNode, startStallHeartbeat, stopStallHeartbeat, recoverPlayback, stallHeartbeatTick, startPlayback, togglePlay" +
+    "tryPlayFromNode, startStallHeartbeat, stopStallHeartbeat, recoverPlayback, stallHeartbeatTick, startPlayback, togglePlay, seekAudio, renderBufferedRanges, " +
+    "beginDrag, resolveDropIndex, finishDrag, markNodeBad, isNodeAvoidable, clearNodeBad, " +
+    "handleGlobalKeydown: typeof handleGlobalKeydown === 'function' ? handleGlobalKeydown : null, " +
+    "handleLoginKeydown: typeof handleLoginKeydown === 'function' ? handleLoginKeydown : null, " +
+    "loginAdmin: typeof loginAdmin === 'function' ? loginAdmin : null, " +
+    "getLoginPending: () => (typeof adminLoggingIn !== 'undefined' ? adminLoggingIn : null)" +
     "};";
   runInNewContext(prelude + scriptText + hook, sandbox, { filename: "client.js" });
   return { T: sandbox.__T, timers, sandbox, clip };
@@ -544,4 +549,544 @@ test("client stall-resume mutation: removing the oncanplay wiring leaves the wed
   const { T } = runClient(mutated);
   await flushMicrotasks();
   assert.equal(typeof T.audio.oncanplay, "undefined", "without the wiring the element has no canplay auto-resume — proves test 1 is load-bearing");
+});
+
+test("recovery point: seek-wait stall resumes at the live playhead, never the stale memory", () => {
+  const { T } = runClient(extractClientScript());
+  T.startPlayback(SONG, 0, false, false);
+  T.audio.paused = false; T.audio.readyState = 4; T.audio.currentTime = 30;
+  T.fireTimeUpdate();
+  T.audio.currentTime = 120; T.audio.readyState = 0;
+  T.recoverPlayback();
+  assert.equal(T.getState().pendingSeek, 120, "C-1: recovery point is the live playhead, not the pre-seek memory 30");
+});
+
+test("recovery point: an armed pendingSeek (share deep-link) is never downgraded", () => {
+  const { T } = runClient(extractClientScript());
+  T.armShareSeek(95);
+  T.startPlayback(SONG, 0, false, false, true);
+  T.audio.currentTime = 0; T.audio.readyState = 0;
+  T.recoverPlayback();
+  assert.equal(T.getState().pendingSeek, 95, "C-1: armed pendingSeek survives recovery untouched");
+});
+
+test("recovery point: dead element falls back to remembered progress (regression lock)", () => {
+  const { T } = runClient(extractClientScript());
+  T.startPlayback(SONG, 0, false, false);
+  T.audio.paused = false; T.audio.readyState = 4; T.audio.currentTime = 30;
+  T.fireTimeUpdate();
+  T.audio.currentTime = 0; T.audio.readyState = 0;
+  T.recoverPlayback();
+  assert.equal(T.getState().pendingSeek, 30, "C-1: playhead unusable (0) falls back to lastKnownProgress");
+});
+
+test("recovery point: togglePlay dead-element reconnection keeps remembered progress (W5 regression lock)", () => {
+  const { T } = runClient(extractClientScript());
+  T.startPlayback(SONG, 0, false, false);
+  T.audio.paused = false; T.audio.readyState = 4; T.audio.currentTime = 30;
+  T.fireTimeUpdate();
+  T.audio.error = new Error("x"); T.audio.readyState = 0; T.audio.currentTime = 0;
+  T.audio.paused = true;
+  T.togglePlay();
+  assert.equal(T.getState().pendingSeek, 30, "C-1: the togglePlay dead-element branch must keep lastKnownProgress, not the zeroed playhead");
+});
+
+test("seekAudio: out-of-range clientX clamps to [0, duration]; dead bar and non-finite duration are no-ops", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  const bar = sandbox.document.getElementById('progress-bar');
+  bar.getBoundingClientRect = () => ({ left: 0, width: 100 });
+  const barClasses = new Set();
+  bar.classList = { add(c) { barClasses.add(c); }, remove(c) { barClasses.delete(c); }, toggle() {}, contains(c) { return barClasses.has(c); } };
+  T.audio.duration = 100;
+  T.seekAudio({ clientX: 150 });
+  assert.equal(T.audio.currentTime, 100, "C-2: pct clamped to 1 -> currentTime = duration");
+  T.seekAudio({ clientX: -50 });
+  assert.equal(T.audio.currentTime, 0, "C-2: pct clamped to 0");
+  T.seekAudio({ clientX: 50 });
+  assert.equal(T.audio.currentTime, 50, "C-2: in-range click maps linearly and arms is-seeking");
+  assert.ok(bar.classList.contains('is-seeking'), "C-4: an effective seek arms the seeking visual state");
+  T.audio.onseeked();
+  assert.ok(!bar.classList.contains('is-seeking'), "C-4: onseeked clears the seeking visual state");
+  bar.getBoundingClientRect = () => ({ left: 0, width: 0 });
+  T.audio.currentTime = 42;
+  T.seekAudio({ clientX: 30 });
+  assert.equal(T.audio.currentTime, 42, "C-2: zero-width rect (hidden bar) must be a no-op, never Infinity*duration");
+  bar.getBoundingClientRect = () => ({ left: 0, width: 100 });
+  T.audio.duration = NaN;
+  T.seekAudio({ clientX: 80 });
+  assert.equal(T.audio.currentTime, 42, "C-2: NaN duration is a no-op");
+});
+
+test("renderBufferedRanges: playhead-containing range is drawn; empty buffered and missing duration zero out", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  const el = sandbox.document.getElementById('progress-buffered');
+  T.audio.duration = 200; T.audio.currentTime = 60;
+  T.audio.buffered = { length: 2, start: (i) => [0, 120][i], end: (i) => [30, 200][i] };
+  T.renderBufferedRanges();
+  assert.equal(el.style.width, "15%", "C-3: no range contains playhead 60 -> fallback first range 30/200 = 15%");
+  T.audio.buffered = { length: 2, start: (i) => [0, 120][i], end: (i) => [100, 200][i] };
+  T.renderBufferedRanges();
+  assert.equal(el.style.left, "0%", "C-3: containing range [0,100] at playhead 60");
+  assert.equal(el.style.width, "50%", "C-3: width (100-0)/200");
+  T.audio.buffered = { length: 0, start: () => 0, end: () => 0 };
+  T.renderBufferedRanges();
+  assert.equal(el.style.width, "0%", "C-3: empty TimeRanges -> zero width");
+  T.audio.duration = NaN;
+  T.audio.buffered = { length: 1, start: () => 0, end: () => 50 };
+  T.renderBufferedRanges();
+  assert.equal(el.style.width, "0%", "C-3: non-finite duration -> zero out, never NaN%");
+});
+
+function makeCard(name) {
+  const card = {
+    name,
+    classList: { contains: (c) => c === "source-card" },
+    parentNode: null,
+    previousElementSibling: null,
+    nextElementSibling: null,
+  };
+  return card;
+}
+function wireCards(cards) {
+  cards.forEach((c, i) => {
+    c.previousElementSibling = cards[i - 1] || null;
+    c.nextElementSibling = cards[i + 1] || null;
+    c.parentNode = { insertBefore: (node, ref) => {
+      const from = cards.indexOf(node);
+      const to = cards.indexOf(ref);
+      cards.splice(from, 1);
+      cards.splice(cards.indexOf(ref) + (to > from ? 1 : 0), 0, node);
+    } };
+  });
+}
+
+function makeDragCard(name, top) {
+  const card = makeCard(name);
+  card.__dragging = false;
+  card.classList.add = (c) => { if (c === "dragging") card.__dragging = true; };
+  card.classList.remove = (c) => { if (c === "dragging") card.__dragging = false; };
+  card.dataset = {};
+  card.getBoundingClientRect = () => ({ top, height: 100, left: 0, width: 300 });
+  return card;
+}
+function wireDragContainer(sandbox, cards) {
+  const container = sandbox.document.getElementById('sources-container');
+  container.querySelectorAll = () => cards;
+  container.querySelector = () => null;
+  container.insertBefore = (node, ref) => {
+    const from = cards.indexOf(node);
+    if (from < 0) return;
+    const to = cards.indexOf(ref);
+    cards.splice(from, 1);
+    cards.splice(cards.indexOf(ref) + (to > from ? 1 : 0), 0, node);
+  };
+  container.appendChild = (node) => {
+    const from = cards.indexOf(node);
+    if (from < 0) return;
+    cards.splice(from, 1);
+    cards.push(node);
+  };
+  return container;
+}
+function dragWindowOverrides(winHandlers) {
+  return {
+    addEventListener: (type, fn) => { (winHandlers[type] = winHandlers[type] || []).push(fn); },
+    removeEventListener: (type, fn) => { const l = winHandlers[type] || []; const i = l.indexOf(fn); if (i >= 0) l.splice(i, 1); },
+  };
+}
+function beginDragOn(T, card) {
+  T.beginDrag({ pointerId: 1, clientY: 0, preventDefault() {}, stopPropagation() {}, target: { closest: () => ({ closest: () => card }) } });
+}
+function fireLast(winHandlers, type, event) {
+  const l = winHandlers[type];
+  l[l.length - 1](event);
+}
+
+test("drag move: finishDrag relocates the card node and preserves input values byte-for-byte (A12)", () => {
+  const winHandlers = {};
+  const { T, sandbox } = runClient(extractClientScript(), { windowOverrides: dragWindowOverrides(winHandlers) });
+  const a = makeDragCard("A", 0), b = makeDragCard("B", 100), c = makeDragCard("C", 200);
+  b.value = "编辑中的密码";
+  const cards = [a, b, c];
+  wireDragContainer(sandbox, cards);
+  const order = () => cards.map((x) => x.name).join("");
+
+  beginDragOn(T, b);
+  fireLast(winHandlers, "pointermove", { pointerId: 1, clientY: 200 });
+  assert.equal(order(), "ABC", "precondition: the move phase only shows the indicator, it must not relocate the card");
+  assert.equal(b.__dragging, true, "the dragging translucency class must be on during the drag");
+
+  T.finishDrag({ pointerId: 1, clientY: 200 });
+  assert.equal(order(), "ACB", "a drop before C relocates B via node move (insertBefore), never innerHTML");
+  assert.equal(b.value, "编辑中的密码", "input values survive a move byte-for-byte (A12)");
+  assert.equal(b.__dragging, false, "no .dragging residue after the drop");
+  assert.equal((winHandlers.pointermove || []).length, 0, "window drag listeners must be detached after the drop");
+});
+
+test("drag guards: pointerId mismatch, un-started end, out-of-container drop are all no-ops", () => {
+  const winHandlers = {};
+  const { T, sandbox } = runClient(extractClientScript(), { windowOverrides: dragWindowOverrides(winHandlers) });
+  const a = makeDragCard("A", 0), b = makeDragCard("B", 100), c = makeDragCard("C", 200);
+  const cards = [a, b, c];
+  wireDragContainer(sandbox, cards);
+  const order = () => cards.map((x) => x.name).join("");
+
+  T.finishDrag({ pointerId: 1, clientY: 0 });
+  assert.equal(order(), "ABC", "an un-started finishDrag must be a no-op, never a crash and never a relocation");
+
+  beginDragOn(T, b);
+  fireLast(winHandlers, "pointermove", { pointerId: 1, clientY: 250 });
+  fireLast(winHandlers, "pointerup", { pointerId: 99, clientY: 250 });
+  assert.equal(order(), "ABC", "a pointerId mismatch on pointerup must not relocate the card");
+  assert.equal(b.__dragging, true, "a mismatched pointerup must not tear down the active drag state");
+
+  T.finishDrag({ pointerId: 1, clientY: 999 });
+  assert.equal(order(), "ACB", "a drop beyond the last card appends the dragged card to the end");
+  assert.equal(b.__dragging, false, "no .dragging residue after the drop");
+
+  const p = makeDragCard("P", 0), q = makeDragCard("Q", 100);
+  const pair = [p, q];
+  wireDragContainer(sandbox, pair);
+  const pairOrder = () => pair.map((x) => x.name).join("");
+  const origGet = sandbox.document.getElementById;
+  beginDragOn(T, q);
+  fireLast(winHandlers, "pointermove", { pointerId: 1, clientY: 300 });
+  sandbox.document.getElementById = (id) => (id === 'sources-container' ? null : origGet(id));
+  T.finishDrag({ pointerId: 1, clientY: 300 });
+  sandbox.document.getElementById = origGet;
+  assert.equal(pairOrder(), "PQ", "an out-of-container drop (no container) must return the card to its origin");
+  assert.equal(q.__dragging, false, "an out-of-container drop must still clear the dragging state");
+});
+
+test("node health: mark/avoid/clear/TTL round-trip on the localStorage stub", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  assert.equal(T.isNodeAvoidable('s1'), false, "no record -> the source is healthy");
+  T.markNodeBad('s1');
+  assert.equal(T.isNodeAvoidable('s1'), true, "a marked source is avoidable within TTL");
+  assert.ok(sandbox.localStorage._m['webdav_player_node_health_v1'], "health bits must persist under the dedicated storage key");
+  const stored = JSON.parse(sandbox.localStorage._m['webdav_player_node_health_v1']);
+  assert.equal(typeof stored.s1, "number", "badUntil must be stored as a number");
+  stored.s1 = Date.now() - 1;
+  sandbox.localStorage._m['webdav_player_node_health_v1'] = JSON.stringify(stored);
+  assert.equal(T.isNodeAvoidable('s1'), false, "an expired badUntil (TTL) reads back as healthy");
+  T.markNodeBad('s1');
+  T.clearNodeBad('s1');
+  assert.equal(T.isNodeAvoidable('s1'), false, "an explicit clear removes the avoidance mark (success clears)");
+  T.markNodeBad('');
+  assert.equal(T.isNodeAvoidable(''), false, "an empty sourceId is a guarded no-op");
+});
+
+test("playback start: an avoidable first node is skipped to the first healthy line, last line always tried", async () => {
+  const SONG2 = { id: "def67890", name: "Beta - Two.mp3", availableNodes: [{ sourceId: "s1", href: "Beta%20-%20Two.mp3" }, { sourceId: "s2", href: "Beta%20-%20Two%20mirror.mp3" }] };
+  const { T, sandbox } = runClient(extractClientScript());
+  await T.tryPlayFromNode(SONG2, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 0, "no health records -> zero bypass: exact current behavior");
+  assert.equal(sandbox.document.getElementById('info-node').textContent, '线路: 1/2', "info-node must show the requested line when nothing is avoided");
+
+  T.markNodeBad('s1');
+  await T.tryPlayFromNode(SONG2, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "an avoidable first node is skipped to the first healthy line");
+  assert.equal(sandbox.document.getElementById('info-node').textContent, '线路: 2/2', "info-node must reflect the effective line, not the requested one");
+
+  T.markNodeBad('s2');
+  await T.tryPlayFromNode(SONG2, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "all lines avoided -> the last line is still hard-tried (avoid, never ban)");
+  assert.equal(sandbox.document.getElementById('info-node').textContent, '线路: 2/2', "the hard-tried last line is announced as-is");
+});
+
+// ---- E-4 契约 C-A：空格 hijack 门控 ----
+test("E-4 C-A: space on page body toggles playback and preventDefaults", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = null;
+  let played = 0, prevented = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(played, 1, "C-A 触发域: nothing focused => space reaches togglePlay");
+  assert.equal(prevented, 1, "C-A: a handled space must preventDefault so the page does not scroll");
+});
+
+test("E-4 C-A: space inside a text input must not toggle and must not preventDefault", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = { tagName: 'INPUT' };
+  let played = 0, prevented = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(played, 0, "C-A 不该触发域①: typing a space in an input must not hijack playback");
+  assert.equal(prevented, 0, "C-A: an unhandled space must let the browser insert it");
+});
+
+test("E-4 C-A: space on a focused button must fall through to native activation", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = { tagName: 'BUTTON' };
+  let played = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() {} });
+  assert.equal(played, 0, "C-A 不该触发域②: a focused control keeps its native space activation");
+});
+
+test("E-4 C-A: space while a modal is open must not toggle", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = null;
+  const m = sandbox.document.getElementById('pass-modal');
+  m.classList = { contains: (c) => c === 'show', add() {}, remove() {}, toggle() {} };
+  let played = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() {} });
+  assert.equal(played, 0, "C-A 不该触发域④: space must yield while the passphrase modal is showing");
+});
+
+test("E-4 C-A: a held space (event.repeat) must not toggle (autorepeat debounce)", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = null;
+  let played = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', repeat: true, preventDefault() {} });
+  assert.equal(played, 0, "C-A 不该触发域⑥: autorepeat keydown must not flip playback");
+});
+
+test("E-4 C-A: space on a focused select must yield to native activation", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = { tagName: 'SELECT' };
+  let played = 0, prevented = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(played, 0, "C-A 不该触发域②: a focused SELECT keeps its native space dropdown activation");
+  assert.equal(prevented, 0, "C-A: an unhandled space must not block the native select behavior");
+});
+
+test("E-4 C-A: space on a focused link must yield to native activation", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = { tagName: 'A' };
+  let played = 0, prevented = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(played, 0, "C-A 不该触发域②: a focused A link keeps its native space activation");
+  assert.equal(prevented, 0, "C-A: an unhandled space must not block the link's default action");
+});
+
+test("E-4 C-A: space inside a contenteditable must not toggle", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = { tagName: 'DIV', isContentEditable: true };
+  let played = 0, prevented = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(played, 0, "C-A 不该触发域③: typing a space in a contenteditable must not hijack playback");
+  assert.equal(prevented, 0, "C-A: an unhandled space must let the editor insert it");
+});
+
+test("E-4 C-A: space while the volume popover is open must not toggle", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = null;
+  const vp = sandbox.document.getElementById('volume-popover');
+  vp.classList = { contains: (c) => c === 'show', add() {}, remove() {}, toggle() {} };
+  let played = 0, prevented = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(played, 0, "C-A 不该触发域⑤: space must yield while the volume popover is showing");
+  assert.equal(prevented, 0, "C-A: the popover stays interactive, the space must not be swallowed");
+});
+
+test("E-4 C-A: space while playing pauses the audio (pause half of the toggle)", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = null;
+  let paused = 0, played = 0, prevented = 0;
+  T.audio.paused = false;
+  T.audio.pause = () => { paused++; T.audio.paused = true; };
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: ' ', preventDefault() { prevented++; } });
+  assert.equal(paused, 1, "C-A 触发域: a space during playback must reach togglePlay's pause half exactly once");
+  assert.equal(played, 0, "C-A: the pause half must never re-play from the space path");
+  assert.equal(prevented, 1, "C-A: the handled pause space must also preventDefault the page scroll");
+  assert.equal(T.getState().userPaused, true, "C-A: pausing via space sets userPaused so canplay/heartbeat must not auto-resume");
+});
+
+test("E-4 shared-handler invariant: Escape must not enter the space branch or toggle", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.document.activeElement = null;
+  let played = 0;
+  T.audio.paused = true;
+  T.audio.play = () => { played++; return Promise.resolve(); };
+  T.handleGlobalKeydown({ key: 'Escape', preventDefault() {} });
+  assert.equal(played, 0, "non-space keys must never reach togglePlay (shared handler normal path unchanged)");
+});
+
+// ---- E-5 契约 C-C/C-D：登录框回车 + 防重入 ----
+test("E-5 C-C: Enter in the admin login box submits loginAdmin", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = () => new Promise(() => {}); // stay pending so the in-flight flag is observable
+  assert.equal(T.getLoginPending(), false, "precondition: no submit in flight");
+  T.handleLoginKeydown({ key: 'Enter' });
+  assert.equal(T.getLoginPending(), true, "C-C: Enter must invoke loginAdmin, flipping the submit flag");
+});
+
+test("E-5 C-C: non-Enter keys must not submit", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  let calls = 0;
+  sandbox.fetch = () => { calls++; return new Promise(() => {}); };
+  T.handleLoginKeydown({ key: 'a' });
+  assert.equal(T.getLoginPending(), false, "C-C 不该触发域: typing a letter must not trigger a submit");
+  assert.equal(calls, 0, "no login request on a non-Enter key");
+});
+
+test("E-5 C-D: reentrancy guard blocks the second synchronous submit", () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  let calls = 0;
+  sandbox.fetch = () => { calls++; return new Promise(() => {}); }; // never settles => flag stays true
+  T.loginAdmin();
+  T.loginAdmin();
+  assert.equal(calls, 1, "C-D: the second submit must be blocked, firing exactly one login request");
+});
+
+test("E-5 C-D: the flag resets after a settled submit, permitting a later re-submit", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  let calls = 0;
+  sandbox.fetch = () => { calls++; return Promise.reject(new Error("net-down")); };
+  T.loginAdmin().catch(() => {});
+  await flushMicrotasks();
+  assert.equal(calls, 1, "first submit fires once");
+  assert.equal(T.getLoginPending(), false, "C-D/A-7: finally must reset the flag even when fetch rejects");
+  T.loginAdmin().catch(() => {});
+  await flushMicrotasks();
+  assert.equal(calls, 2, "C-D: once the prior request settled a later submit is allowed (not permanently wedged)");
+});
+
+// ---- 接线结构锁：注册行必须绑到具名 handler ----
+test("E-4/E-5 wiring: keydown registrations bind the named handlers (structure lock)", () => {
+  const raw = extractClientScript();
+  assert.match(raw, /document\.addEventListener\('keydown',\s*handleGlobalKeydown\)/, "global keydown must bind handleGlobalKeydown");
+  assert.match(raw, /getElementById\('login-admin-pass'\)\.addEventListener\('keydown',\s*handleLoginKeydown\)/, "login box must bind handleLoginKeydown");
+  assert.match(raw, /function handleLoginKeydown\(e\) \{\s*if \(e\.key === 'Enter'\) loginAdmin\(\);/, "login Enter must call loginAdmin");
+});
+
+// ---- F5 避让末位重试 ----
+test("F5 last-resort retry: a line skipped by avoidance gets exactly one final attempt before the all-failed branch", async () => {
+  const SONG3 = { id: "f5aa1100", name: "Gamma - Three.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  const { T } = runClient(extractClientScript());
+  const srcs = [];
+  Object.defineProperty(T.audio, "src", {
+    get() { return this.__src || ""; },
+    set(v) { this.__src = v; srcs.push(String(v)); },
+    configurable: true,
+  });
+  T.markNodeBad('s1');
+  await T.tryPlayFromNode(SONG3, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "precondition: s1 is skipped to s2 on a fresh chain");
+  T.audio.onerror();
+  for (let k = 0; k < 4; k++) await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 0, "the skipped s1 must get its last-resort attempt after the normal lines fail");
+  assert.ok(srcs.some((u) => u.indexOf("sourceId=s1") >= 0), "s1's stream URL must actually be attempted, got " + JSON.stringify(srcs));
+});
+
+test("F5 no-mark chain unchanged: a healthy line set never enters the retry path", async () => {
+  const SONG4 = { id: "f5bb2200", name: "Delta - Four.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  const { T } = runClient(extractClientScript());
+  await T.tryPlayFromNode(SONG4, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 0, "no avoidance -> no skip -> no queue: exact current behavior");
+  T.audio.onerror();
+  for (let k = 0; k < 4; k++) await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "with no queued skips the chain advances s1 -> s2 and terminates normally");
+});
+
+test("F5 bound & convergence: all four lines avoided -> every line gets a genuine attempt, attempts are finite, the chain reaches the all-failed branch", async () => {
+  const SONG5 = { id: "f5cc3300", name: "Eps - Five.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }, { sourceId: "s3", href: "c.mp3" }, { sourceId: "s4", href: "d.mp3" }] };
+  const { T } = runClient(extractClientScript());
+  const srcs = [];
+  Object.defineProperty(T.audio, "src", {
+    get() { return this.__src || ""; },
+    set(v) { this.__src = v; srcs.push(String(v)); },
+    configurable: true,
+  });
+  ['s1', 's2', 's3'].forEach((id) => T.markNodeBad(id));
+  await T.tryPlayFromNode(SONG5, 0, false);
+  for (let k = 0; k < 40; k++) {
+    await flushMicrotasks();
+    if (T.audio.onerror) T.audio.onerror();
+  }
+  await flushMicrotasks();
+  const settled = srcs.length;
+  assert.ok(settled > 0 && settled <= 12, "attempts must be finite and well under runaway, got " + settled + " (measured trace: s4,s1,s4,s2,s4,s3,s4 = 7)");
+  const tried = new Set(srcs.map((u) => /sourceId=([^&]+)/.exec(u)[1]));
+  assert.ok(tried.has('s1') && tried.has('s2') && tried.has('s3') && tried.has('s4'), "every avoided line must get a real last-resort attempt, tried=" + [...tried].join(","));
+  for (let k = 0; k < 12; k++) {
+    await flushMicrotasks();
+    if (T.audio.onerror) T.audio.onerror();
+  }
+  await flushMicrotasks();
+  assert.equal(srcs.length, settled, "the chain must CONVERGE: once the skip-queue drains and the last line is hard-tried, no further attempts may be issued");
+});
+
+// ---- retry-queue advance ordering (review finding: skipped-line failure must pop the next queued skip) ----
+test("retry-queue advance: a failed last-resort line plays the next queued skip, not a +1 re-scan onto an already-tried line", async () => {
+  const SONGR = { id: "r3adv001", name: "Retr - Queue.mp3", availableNodes: [
+    { sourceId: "a", href: "a.mp3" }, { sourceId: "b", href: "b.mp3" }, { sourceId: "c", href: "c.mp3" },
+    { sourceId: "d", href: "d.mp3" }, { sourceId: "e", href: "e.mp3" }] };
+  const { T } = runClient(extractClientScript());
+  T.markNodeBad("a");
+  T.markNodeBad("b");
+  await T.tryPlayFromNode(SONGR, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 2, "precondition: a and b skipped into the queue, first healthy line c (index 2) plays");
+  // Fail the normal lines forward (c -> d -> e), which drives the chain past the end and into the
+  // retry-queue pass; the queue pops its first skipped line a (index 0) as a genuine last-resort try.
+  for (let k = 0; k < 3; k++) {
+    T.audio.onerror();
+    for (let j = 0; j < 6; j++) await flushMicrotasks();
+  }
+  assert.equal(T.getState().currentNodeIndex, 0, "precondition: after c/d/e fail, the queue pops last-resort line a (index 0)");
+  // Now the last-resort line a itself fails. Correct behavior: advance to the next QUEUED skip (b, index 1).
+  // Buggy behavior: effectiveIndex + 1 = 1 re-enters the avoidable-skip walk and lands back on the last
+  // hard-tried line e (index 4), re-trying an already-failed line and stranding queued skip b.
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "retry-queue advance: a failing must play the next queued skip b (index 1), not re-scan onto a retried line");
+});
+
+test("G3 onerror marks only on a confirmed origin-probe failure: a media/decode error whose probe answered OK must advance the mirror WITHOUT blacklisting the source", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => "" });
+  const SONG_OK = { id: "g3ok0001", name: "Probe - Ok.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  await T.tryPlayFromNode(SONG_OK, 0, false);
+  await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 0, "precondition: s1 (index 0) plays, nothing avoided");
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.getState().currentNodeIndex, 1, "a decode/media error still advances to the next mirror");
+  assert.equal(T.isNodeAvoidable("s1"), false, "a source whose probe answered OK must NOT be avoided for 24h over a decode error");
+  assert.equal(sandbox.localStorage.getItem("webdav_player_node_health_v1"), null, "no health bits may be written when the probe confirms the origin is alive");
+});
+
+test("G3 onerror still marks when the probe confirms a non-2xx origin failure (regression shield against over-fix)", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = async () => ({ ok: false, status: 503, json: async () => ({}), text: async () => "" });
+  const SONG_BAD = { id: "g3bad001", name: "Probe - Bad.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  await T.tryPlayFromNode(SONG_BAD, 0, false);
+  await flushMicrotasks();
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.isNodeAvoidable("s1"), true, "a probe that reports a non-2xx origin failure must still mark the node bad");
+});
+
+test("G3 onerror still marks when the probe fetch itself throws / network down (regression shield)", async () => {
+  const { T, sandbox } = runClient(extractClientScript());
+  sandbox.fetch = async () => { throw new Error("net-down"); };
+  const SONG_THROW = { id: "g3thr001", name: "Probe - Throw.mp3", availableNodes: [{ sourceId: "s1", href: "a.mp3" }, { sourceId: "s2", href: "b.mp3" }] };
+  await T.tryPlayFromNode(SONG_THROW, 0, false);
+  await flushMicrotasks();
+  T.audio.onerror();
+  for (let k = 0; k < 6; k++) await flushMicrotasks();
+  assert.equal(T.isNodeAvoidable("s1"), true, "a probe that throws must be treated as an origin failure and mark the node bad");
 });

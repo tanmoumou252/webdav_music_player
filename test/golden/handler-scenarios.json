@@ -815,8 +815,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110196,
-      "sha256": "99d21c2ec41803032c76b6931a1f75496f840c017d362d9b848002c78a28c341"
+      "htmlLen": 122753,
+      "sha256": "caab9fc8cb34351ab50c941e6d2a8a5e9a74ac878755d475001e272607bccf4c"
     },
     "stubCalls": [],
     "post": {}
@@ -830,8 +830,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110159,
-      "sha256": "9629bb4b51fa323135e92f9595af75528215cf897d49e44e29529266f6920977"
+      "htmlLen": 122716,
+      "sha256": "41352def156be2be716636b441d76e12a5b56d919684aed2dff462cb2a7eab83"
     },
     "stubCalls": [],
     "post": {}
@@ -845,8 +845,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110159,
-      "sha256": "ce350f8755139cf2b8027e55d4f8705fe8a53c6948f362330c0632c151425488"
+      "htmlLen": 122716,
+      "sha256": "e241c7be9e6140178aa09005b743c68c2abe2f7f4bfd7dae0139d5a60b81ed39"
     },
     "stubCalls": [],
     "post": {}
@@ -860,8 +860,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110100,
-      "sha256": "f42238a1916b8f6b96043bc29c6cebfedc22d22ab3f41116310556400f4801a6"
+      "htmlLen": 122657,
+      "sha256": "0d2b7933b5338061f42a198aab80b104d34bf161badbeacd508c422edde42c4c"
     },
     "stubCalls": [],
     "post": {}
@@ -875,8 +875,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110100,
-      "sha256": "f42238a1916b8f6b96043bc29c6cebfedc22d22ab3f41116310556400f4801a6"
+      "htmlLen": 122657,
+      "sha256": "0d2b7933b5338061f42a198aab80b104d34bf161badbeacd508c422edde42c4c"
     },
     "stubCalls": [],
     "post": {}
@@ -1191,6 +1191,72 @@
     ],
     "post": {}
   },
+  "stream-multirange-forwarded": {
+    "status": 200,
+    "statusText": "OK",
+    "headers": {
+      "access-control-allow-headers": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
+      "access-control-allow-origin": "*",
+      "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
+      "content-length": "500",
+      "content-type": "audio/mpeg"
+    },
+    "body": {
+      "binLen": 500,
+      "sha256": "fab6d25d512442fc25ce3b1304a014240c059c6a5f619201fe97681c235a8bbf"
+    },
+    "stubCalls": [
+      {
+        "url": "https://dav.example.com/dav/Alpha%20-%20One.mp3",
+        "method": "GET",
+        "headers": {
+          "accept-encoding": "identity",
+          "authorization": "Basic dTE6cDE=",
+          "range": "bytes=0-1,5-6"
+        }
+      }
+    ],
+    "post": {}
+  },
+  "jsmediatags-kv-hit": {
+    "status": 200,
+    "statusText": "",
+    "headers": {
+      "access-control-allow-headers": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
+      "access-control-allow-origin": "*",
+      "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
+      "cache-control": "public, max-age=604800",
+      "content-type": "application/javascript; charset=utf-8"
+    },
+    "body": "/* jsmediatags 3.9.5 fake payload */",
+    "stubCalls": [],
+    "post": {}
+  },
+  "jsmediatags-kv-miss-backfill": {
+    "status": 200,
+    "statusText": "",
+    "headers": {
+      "access-control-allow-headers": "*",
+      "access-control-allow-methods": "GET, POST, OPTIONS, HEAD",
+      "access-control-allow-origin": "*",
+      "access-control-expose-headers": "Content-Range, Content-Length, Accept-Ranges",
+      "cache-control": "public, max-age=604800",
+      "content-type": "application/javascript; charset=utf-8"
+    },
+    "body": "/* jsmediatags 3.9.5 fake payload */",
+    "stubCalls": [
+      {
+        "url": "https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js",
+        "method": "GET",
+        "headers": {}
+      }
+    ],
+    "post": {
+      "kvBackfilled": true
+    }
+  },
   "list-all-writes-share-index": {
     "status": 200,
     "statusText": "",
@@ -1326,8 +1392,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110159,
-      "sha256": "9629bb4b51fa323135e92f9595af75528215cf897d49e44e29529266f6920977"
+      "htmlLen": 122716,
+      "sha256": "41352def156be2be716636b441d76e12a5b56d919684aed2dff462cb2a7eab83"
     },
     "stubCalls": [],
     "post": {}
@@ -1341,8 +1407,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110100,
-      "sha256": "f42238a1916b8f6b96043bc29c6cebfedc22d22ab3f41116310556400f4801a6"
+      "htmlLen": 122657,
+      "sha256": "0d2b7933b5338061f42a198aab80b104d34bf161badbeacd508c422edde42c4c"
     },
     "stubCalls": [],
     "post": {}
@@ -1356,8 +1422,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110477,
-      "sha256": "bfefa537f1482f6ab7ce4bd4f996b2882372777b1229ff88e8451ce123c444c0"
+      "htmlLen": 123034,
+      "sha256": "799b125e2a1724960dc792fadc97879c6d71dea9ca354e40e14dfffc1b441ee2"
     },
     "stubCalls": [],
     "post": {}
@@ -1371,8 +1437,8 @@
       "content-type": "text/html; charset=utf-8"
     },
     "body": {
-      "htmlLen": 110100,
-      "sha256": "f42238a1916b8f6b96043bc29c6cebfedc22d22ab3f41116310556400f4801a6"
+      "htmlLen": 122657,
+      "sha256": "0d2b7933b5338061f42a198aab80b104d34bf161badbeacd508c422edde42c4c"
     },
     "stubCalls": [],
     "post": {}
