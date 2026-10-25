@@ -21,8 +21,25 @@ async function resolveSharedSongName(env, playId) {
   return null;
 }
 
-export default {
-  async fetch(request, env) {
+function resolveRateLimitIp(request) {
+  if (request.cf) {
+    const cfIp = (request.headers.get("cf-connecting-ip") || "").trim();
+    if (cfIp) return sanitizeRateLimitIp(cfIp);
+  }
+  const eoIp = request.eo && typeof request.eo.clientIp === "string" ? request.eo.clientIp.trim() : "";
+  if (eoIp) return sanitizeRateLimitIp(eoIp);
+  return "unknown";
+}
+
+function sanitizeRateLimitIp(value) {
+  let ip = String(value).trim();
+  const bracketed = /^\[([^\]]+)\](?::(?:0|[1-9]\d{0,4}))?$/.exec(ip);
+  if (bracketed) ip = bracketed[1];
+  else if (/^[0-9.]+:(?:0|[1-9]\d{0,4})$/.test(ip)) ip = ip.replace(/:(?:0|[1-9]\d{0,4})$/, "");
+  return /^[A-Za-z0-9.:_-]{1,64}$/.test(ip) ? ip : "unknown";
+}
+
+async function handleRequest(request, env) {
     const url = new URL(request.url);
 
     const corsHeaders = {
@@ -122,19 +139,7 @@ export default {
     };
 
     const requireAdmin = async () => {
-      const adminPass = await env.MUSIC_KV.get("admin_pass");
-      if (!adminPass) return false;
-      const headerPass = request.headers.get("x-admin-pass");
-      if (headerPass) {
-        if (/^[0-9a-f]{64}$/.test(adminPass)) {
-          if ((await hashAdminPass(headerPass)) === adminPass) return true;
-        } else {
-          if (headerPass === adminPass) {
-            await env.MUSIC_KV.put("admin_pass", await hashAdminPass(headerPass));
-            return true;
-          }
-        }
-      }
+      if (!(await env.MUSIC_KV.get("admin_pass"))) return false;
       return isSessionValid(env, getCookieToken());
     };
 
@@ -170,7 +175,7 @@ export default {
     }
 
     if (url.pathname === "/api/admin/login" && request.method === "POST") {
-      const ip = request.headers.get("cf-connecting-ip") || "unknown";
+      const ip = resolveRateLimitIp(request);
       const rlKey = "rl_login_" + ip;
       const rlCount = parseInt((await env.MUSIC_KV.get(rlKey)) || "0", 10);
       if (rlCount >= 5) {
@@ -242,9 +247,14 @@ export default {
       headers.set("Content-Type", "application/json");
       if (newAdminPass) {
         await env.MUSIC_KV.put("admin_pass", await hashAdminPass(newAdminPass));
-        const oldSessions = await env.MUSIC_KV.list({ prefix: "session_" });
-        for (const k of oldSessions.keys) {
-          await env.MUSIC_KV.delete(k.name);
+        let sessionCursor;
+        for (;;) {
+          const oldSessions = await env.MUSIC_KV.list(sessionCursor ? { prefix: "session_", cursor: sessionCursor } : { prefix: "session_" });
+          for (const k of oldSessions.keys) {
+            await env.MUSIC_KV.delete(k.name);
+          }
+          if (oldSessions.list_complete || !oldSessions.cursor) break;
+          sessionCursor = oldSessions.cursor;
         }
         headers.append("Set-Cookie", sessionCookie(await createSession(env)));
       }
@@ -435,7 +445,7 @@ export default {
         return new Response(JSON.stringify({ error: "缺少源或路径参数" }), { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
       }
 
-      if (/^https?:\/\//i.test(rawFile)) {
+      if (/^https?:\/\//i.test(rawFile) || rawFile.includes("?") || rawFile.includes("#")) {
         return streamPathReject(rawFile, request.method, src.name, corsHeaders, await requireAdminSafe());
       }
 
@@ -445,7 +455,17 @@ export default {
         return streamPathReject(targetUrl, request.method, src.name, corsHeaders, await requireAdminSafe());
       }
 
-      if (!/\.(mp3|flac|m4a|ogg|wav|aac|ape|alac|opus|wma|dsd|dsf|dff|mka)$/i.test(rawFile)) {
+      let streamPathOk = false;
+      try {
+        const targetParsed = new URL(targetUrl);
+        if (!targetParsed.search && !targetParsed.hash) {
+          const decodedTargetPath = decodeURIComponent(targetParsed.pathname);
+          streamPathOk = /\.(mp3|flac|m4a|ogg|wav|aac|ape|alac|opus|wma|dsd|dsf|dff|mka)$/i.test(decodedTargetPath);
+        }
+      } catch (e) {
+        streamPathOk = false;
+      }
+      if (!streamPathOk) {
         return streamPathReject(targetUrl, request.method, src.name, corsHeaders, await requireAdminSafe());
       }
 
@@ -468,7 +488,7 @@ export default {
         forwardHeaders.set("Accept-Encoding", "identity");
       }
 
-      const upstreamTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS);
+      const upstreamTimeoutMs = parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS, 12000);
       const upstreamAbort = new AbortController();
       try {
         if (request.signal) {
@@ -837,6 +857,5 @@ export default {
       html = html.replace("<title>Cloud Music Hub</title>", () => "<title>" + sharedTitle + "</title>");
     }
     return new Response(html, { headers: pageHeaders });
-  }
-};
+}
 

@@ -44,13 +44,17 @@
 仓库按"可回归测试的切片源 → 逐字节拼接 → 单文件产物"组织：
 
 ```
-src/01-handler.part.js      # 七片 = worker.js 的连续字节切片，按文件名顺序拼接即还原
+src/01-handler.part.js      # 八片 = worker.js 的连续字节切片，按文件名顺序拼接即还原
 src/02-share.part.js        # 分享链接、OG 元数据与 HTML 转义
 src/03-text.part.js         # track id / XML 实体 / 歌名归一
 src/04-diagnostic.part.js   # WebDAV 故障中文诊断
 src/05-auth.part.js         # 口令哈希、源 URL 校验、会话与 Cookie
 src/06-webdav.part.js       # 路径收敛、URL 解析、PROPFIND 列表、Range 解析与流切片
 src/07-render.part.js       # 页面模板区（renderHTML）在这一片里
+src/08-entry.part.js        # CF Workers 平台入口（export default { fetch }）
+edgeone/                    # EdgeOne 适配层与平台入口源件（eo-prelude.js / eo-entry.js / cf-pages-entry.js）与部署说明 DEPLOY.md
+edge-functions/             # EdgeOne Pages 产物（index.js 与 [[default]].js，字节相同），由 build.mjs 生成
+functions/                  # Cloudflare Pages 产物（[[path]].js 与 index.js，字节相同），由 build.mjs 生成
 golden/worker.head.mjs      # worker.js 的逐字节冻结副本，不依赖 git 的比对锚（.mjs 后缀便于被 import）
 build.mjs                   # 纯 node 拼接器 + 字节相等棘轮（--record 重录模式）
 tools/make-og-icon.mjs      # 站点图标生成器：栅格化 PNG 并写入 src/02-share.part.js 的图标常量（自带回读自校验）
@@ -117,6 +121,12 @@ node --test "test/*.test.mjs"
 6. 管理面板支持将源配置导出为 JSON 备份，也可从 JSON 导入并按 URL 自动合并更新，这也意味着目前同一个地址只会更新里面的账号鉴权信息，不会因为这是另外一个账号就新开一个源。此外支持"复制口令 / 粘贴口令"：用单行 `WMP1.` 加密文本在两份部署之间直接转移源配置——口令只与导出时设置的加密口令绑定（与登录密码无关），口令文本本质是在转移账号凭据，请只发给可信的人。
 
 > 本仓库的 `wrangler.toml` 保存的是本站点自己的 Worker 名与 KV 命名空间 ID；复刻到你自己的账号时，请把 `name` 与 `[[kv_namespaces]] id` 替换为你自己的值，否则部署会报 code 10041（namespace not found）。
+
+### 一键部署到 EdgeOne Pages
+
+[![使用 EdgeOne Makers 部署](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/pages/new?repository-url=https%3A%2F%2Fgithub.com%2Ftanmoumou252%2Fwebdav_music_player)
+
+EdgeOne Pages 的完整部署说明（KV 命名空间绑定、可选环境变量、平台限制与注意事项）见 [edgeone/DEPLOY.md](edgeone/DEPLOY.md)。
 
 ## 使用说明
 

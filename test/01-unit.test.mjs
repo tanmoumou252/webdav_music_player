@@ -601,6 +601,7 @@ test("build.mjs --verify-staged audits the git index, not only the working tree"
   assert.ok(src.includes("if (VERIFY_STAGED) {"), "verify-staged branch must exist");
   assert.ok(src.includes('["ls-files", "--cached", "-z", "--", "src"]'), "verify-staged must enumerate the staged src/*.part.js set via git ls-files");
   assert.ok(src.includes('["show", ":" + name]'), "verify-staged must read and compare each staged blob via git show :<path>");
+  assert.ok(src.includes('["edgeone/eo-prelude.js", "edgeone/eo-entry.js", "edgeone/cf-pages-entry.js"]'), "verify-staged must audit the three edgeone sources against the git index");
 });
 
 test("parseContentRangeTotal: derives the full length from a Content-Range value", () => {
@@ -628,6 +629,28 @@ test("parseUpstreamTimeoutMs: degenerate env knob values never yield NaN or sub-
   assert.equal(P.parseUpstreamTimeoutMs(7000), 7000, "S-1: in-range number passes through");
   assert.equal(P.parseUpstreamTimeoutMs("7000"), 7000, "S-1: numeric string parses");
   assert.equal(P.parseUpstreamTimeoutMs(1e9), 300000, "S-1: huge values clamp to the 300s ceiling");
+});
+
+test("parseUpstreamTimeoutMs: the explicit fallbackMs second argument replaces 8000 only when raw is missing/invalid, and is never re-clamped", () => {
+  assert.equal(P.parseUpstreamTimeoutMs(undefined, 12000), 12000, "S-2: missing knob with explicit fallback yields the fallback");
+  assert.equal(P.parseUpstreamTimeoutMs("0", 12000), 12000, "S-2: zero is invalid, fallback wins");
+  assert.equal(P.parseUpstreamTimeoutMs("abc", 12000), 12000, "S-2: non-numeric is invalid, fallback wins");
+  assert.equal(P.parseUpstreamTimeoutMs(undefined), 8000, "S-2: no second argument keeps the 8000 default");
+  assert.equal(P.parseUpstreamTimeoutMs(null), 8000, "S-2: null raw with no fallback keeps 8000");
+  assert.equal(P.parseUpstreamTimeoutMs("500"), 500, "S-2: valid raw clamps to MIN regardless of fallback absence");
+  assert.equal(P.parseUpstreamTimeoutMs("500", 12000), 500, "S-2: a valid raw value always beats the fallback (measured-at-boundary distinguishable)");
+  assert.equal(P.parseUpstreamTimeoutMs("999999"), 300000, "S-2: ceiling clamp unchanged in one-argument form");
+});
+
+test("cross-file invariant: the stream 12000 fallback plus a 1s margin never exceeds the client watchdog", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const handlerSrc = readFileSync(join(root, "src", "01-handler.part.js"), "utf8");
+  assert.ok(handlerSrc.includes("parseUpstreamTimeoutMs(env && env.STREAM_FETCH_TIMEOUT_MS, 12000);"), "the stream call site must carry the 12000 literal (cross-file drift lock)");
+  const renderSrc = readFileSync(join(root, "src", "07-render.part.js"), "utf8");
+  const watchdog = Number((renderSrc.match(/const STALL_TIMEOUT_MS = (\d+);/) || [])[1]);
+  assert.ok(watchdog > 0, "the client watchdog constant must exist in the render slice");
+  assert.ok(12000 + 1000 <= watchdog, "stream fallback 12000 plus a 1s margin must not exceed the client watchdog");
 });
 
 // ---- D-8 属性/变异测试辅助（零依赖，自包含；只读 src，不改任何被测函数） ----

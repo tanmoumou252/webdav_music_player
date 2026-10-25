@@ -437,6 +437,132 @@ test("stream upstream timeout: admin receives the abort diagnostic", async () =>
   } finally { globalThis.fetch = prevFetch; }
 });
 
+test("admin auth: an x-admin-pass header must never authenticate or bypass the login rate limit", async () => {
+  const env = { MUSIC_KV: createKV({ admin_pass: F.ADMIN_HASH }) };
+  const res = await worker.fetch(makeRequest({
+    method: "GET",
+    url: "https://app.example.com/api/status",
+    headers: { "x-admin-pass": F.ADMIN_PASS }
+  }), env);
+  assert.equal(JSON.parse(await res.text()).isAdmin, false, "header passwords are no longer an auth path; only cookie sessions authenticate");
+});
+
+test("admin auth: a session cookie alone is not admin when admin_pass is not initialized", async () => {
+  const env = { MUSIC_KV: createKV({ ["session_" + "b".repeat(64)]: JSON.stringify({ created: FROZEN_NOW }) }) };
+  const res = await worker.fetch(makeRequest({
+    method: "GET",
+    url: "https://app.example.com/api/status",
+    headers: { "cookie": "admin_token=" + "b".repeat(64) }
+  }), env);
+  assert.equal(JSON.parse(await res.text()).isAdmin, false, "without an initialized admin_pass no session may authenticate, even a KV-planted one");
+  const sourcesRes = await worker.fetch(makeRequest({
+    method: "GET",
+    url: "https://app.example.com/api/admin/sources",
+    headers: { "cookie": "admin_token=" + "b".repeat(64) }
+  }), env);
+  assert.equal(sourcesRes.status, 403, "admin endpoints reject the session too when the password key is absent");
+});
+
+test("login rate-limit key: untrusted headers never pick the bucket; only platform markers do (request.cf then eo.clientIp), hostile values collapse to unknown", async () => {
+  const loginBody = JSON.stringify({ adminPass: "definitely-wrong" });
+  const postLogin = (headers) => makeRequest({
+    method: "POST",
+    url: "https://app.example.com/api/admin/login",
+    headers: Object.assign({ "content-type": "application/json" }, headers),
+    body: loginBody
+  });
+  const xffEnv = { MUSIC_KV: createKV({}) };
+  await worker.fetch(postLogin({ "x-forwarded-for": "203.0.113.7, 9.9.9.9" }), xffEnv);
+  assert.ok(xffEnv.MUSIC_KV.__store.has("rl_login_unknown"), "a bare XFF header without a platform marker collapses into the shared unknown bucket");
+  assert.equal(xffEnv.MUSIC_KV.__store.has("rl_login_9.9.9.9"), false, "client-controlled XFF hops must never select the bucket");
+  const forgedEnv = { MUSIC_KV: createKV({}) };
+  await worker.fetch(postLogin({ "cf-connecting-ip": "198.51.100.9" }), forgedEnv);
+  assert.ok(forgedEnv.MUSIC_KV.__store.has("rl_login_unknown"), "a cf-connecting-ip header without the request.cf platform marker is client-forged and must be ignored");
+  const cfEnv = { MUSIC_KV: createKV({}) };
+  const cfReq = postLogin({ "cf-connecting-ip": "198.51.100.9", "x-forwarded-for": "203.0.113.7" });
+  cfReq.cf = { colo: "TST" };
+  await worker.fetch(cfReq, cfEnv);
+  assert.ok(cfEnv.MUSIC_KV.__store.has("rl_login_198.51.100.9"), "on the Cloudflare platform (request.cf marker present) the edge-set cf-connecting-ip keeps winning");
+  const eoEnv = { MUSIC_KV: createKV({}) };
+  const eoReq = postLogin({});
+  eoReq.eo = { clientIp: "203.0.113.7" };
+  await worker.fetch(eoReq, eoEnv);
+  assert.ok(eoEnv.MUSIC_KV.__store.has("rl_login_203.0.113.7"), "a platform-provided eo clientIp selects the bucket");
+  const garbageEnv = { MUSIC_KV: createKV({}) };
+  const garbageReq = postLogin({});
+  garbageReq.eo = { clientIp: "x".repeat(400) };
+  await worker.fetch(garbageReq, garbageEnv);
+  assert.ok(garbageEnv.MUSIC_KV.__store.has("rl_login_unknown"), "an over-length platform value collapses into the unknown bucket, never truncated into a key");
+  const hostileEnv = { MUSIC_KV: createKV({}) };
+  const hostileReq = postLogin({});
+  hostileReq.eo = { clientIp: "a<b>c" };
+  await worker.fetch(hostileReq, hostileEnv);
+  assert.ok(hostileEnv.MUSIC_KV.__store.has("rl_login_unknown"), "a platform value outside the whitelist collapses into the unknown bucket");
+  const bareEnv = { MUSIC_KV: createKV({}) };
+  await worker.fetch(postLogin({}), bareEnv);
+  assert.ok(bareEnv.MUSIC_KV.__store.has("rl_login_unknown"), "with no trusted client identity at all the shared unknown bucket is used");
+  const v6Env = { MUSIC_KV: createKV({}) };
+  const v6Req = postLogin({});
+  v6Req.eo = { clientIp: "2001:db8::1" };
+  await worker.fetch(v6Req, v6Env);
+  assert.ok(v6Env.MUSIC_KV.__store.has("rl_login_2001:db8::1"), "a bare IPv6 address keeps its last group (no bogus port stripping)");
+  const bracketedEnv = { MUSIC_KV: createKV({}) };
+  const bracketedReq = postLogin({});
+  bracketedReq.eo = { clientIp: "[2001:db8::1]:443" };
+  await worker.fetch(bracketedReq, bracketedEnv);
+  assert.ok(bracketedEnv.MUSIC_KV.__store.has("rl_login_2001:db8::1"), "a bracketed IPv6 with a port reduces to the bare address");
+  const portEnv = { MUSIC_KV: createKV({}) };
+  const portReq = postLogin({});
+  portReq.eo = { clientIp: "198.51.100.9:8080" };
+  await worker.fetch(portReq, portEnv);
+  assert.ok(portEnv.MUSIC_KV.__store.has("rl_login_198.51.100.9"), "an IPv4 with a port reduces to the bare address");
+});
+
+test("password change revokes sessions across every KV list page until list_complete", async () => {
+  const oldToken = "a".repeat(64);
+  const kv = createKV({ admin_pass: F.ADMIN_HASH, ["session_" + oldToken]: "1", session_aaa: "1", session_bbb: "1", session_ccc: "1" });
+  const store = kv.__store;
+  kv.list = async (opts) => {
+    const prefix = (opts && opts.prefix) || "";
+    const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+    const pageSize = 2;
+    const start = opts && opts.cursor ? Math.max(0, keys.indexOf(opts.cursor)) : 0;
+    const complete = start + pageSize >= keys.length;
+    return { keys: keys.slice(start, start + pageSize).map((name) => ({ name })), list_complete: complete, cursor: complete ? undefined : keys[start + pageSize] };
+  };
+  const res = await worker.fetch(makeRequest({
+    method: "POST",
+    url: "https://app.example.com/api/admin/sources",
+    headers: { "content-type": "application/json", "cookie": "admin_token=" + oldToken },
+    body: JSON.stringify({ newAdminPass: "fresh-pass-123" })
+  }), { MUSIC_KV: kv });
+  assert.equal(res.status, 200);
+  assert.equal(store.has("session_aaa"), false, "page-one session revoked");
+  assert.equal(store.has("session_bbb"), false, "page-two session revoked");
+  assert.equal(store.has("session_ccc"), false, "page-two session revoked");
+  assert.equal(store.has("session_" + oldToken), false, "the pre-change admin session is revoked too");
+  assert.ok([...store.keys()].some((k) => k.startsWith("session_")), "a fresh session is issued for the new password");
+});
+
+test("stream path validation: query/fragment tricks never reach the upstream, the decoded pathname carries the extension gate", async () => {
+  const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }) };
+  let upstreamCalled = false;
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => { upstreamCalled = true; throw new Error("upstream must not be called for rejected forms"); };
+  try {
+    for (const file of ["song.bin?.mp3", "song.bin#.mp3", "notes.txt"]) {
+      const res = await worker.fetch(makeRequest({
+        method: "GET",
+        url: "https://app.example.com/api/stream?sourceId=a&file=" + encodeURIComponent(file)
+      }), env);
+      assert.equal(res.status, 403, "the form must be rejected before any upstream call: " + file);
+    }
+    assert.equal(upstreamCalled, false, "no upstream fetch may happen for any rejected form");
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+});
+
 test("D-3 stream: an already-aborted client signal aborts the upstream fetch and is not a normal successful stream", async () => {
   const env = { MUSIC_KV: createKV({ dav_sources: JSON.stringify([{ id: "a", name: "A", url: "https://dav.example.com/dav/" }]) }), STREAM_FETCH_TIMEOUT_MS: "5000" };
   const prevFetch = globalThis.fetch;

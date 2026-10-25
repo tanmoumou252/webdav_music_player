@@ -24,6 +24,40 @@ if (partFiles.length === 0) {
 
 const parts = partFiles.map((f) => readFileSync(join(ROOT, "src", f)));
 const assembled = Buffer.concat(parts);
+const workerPartNames = partFiles.filter((f) => f !== "08-entry.part.js");
+const workerPartBytes = workerPartNames.map((f) => readFileSync(join(ROOT, "src", f)));
+const edgeOneBytes = Buffer.concat([readFileSync(join(ROOT, "edgeone", "eo-prelude.js")), ...workerPartBytes, readFileSync(join(ROOT, "edgeone", "eo-entry.js"))]);
+const cfPagesBytes = Buffer.concat([...workerPartBytes, readFileSync(join(ROOT, "edgeone", "cf-pages-entry.js"))]);
+const EDGE_ARTIFACTS = [
+  ["edge-functions/index.js", edgeOneBytes],
+  ["edge-functions/[[default]].js", edgeOneBytes],
+  ["functions/[[path]].js", cfPagesBytes],
+  ["functions/index.js", cfPagesBytes],
+];
+
+function checkEdgeSyntax() {
+  const probes = [["eo", edgeOneBytes], ["cf-pages", cfPagesBytes]];
+  for (const [name, bytes] of probes) {
+    const probePath = join(ROOT, "build", "out", name + ".check.mjs");
+    writeFileSync(probePath, bytes);
+    try {
+      execFileSync(process.execPath, ["--check", probePath], { cwd: ROOT, stdio: "pipe" });
+    } catch (e) {
+      const probeOut = String((e && e.stdout) || "") + String((e && e.stderr) || "");
+      try { unlinkSync(probePath); } catch (cleanupErr) {}
+      console.error("build: SYNTAX CHECK FAILED for the " + name + " edge artifact — nothing written through to edge-functions/ or functions/, and the broken build/out probe was removed.\n" + probeOut);
+      process.exit(1);
+    }
+  }
+}
+
+function writeEdgeArtifacts() {
+  mkdirSync(join(ROOT, "edge-functions"), { recursive: true });
+  mkdirSync(join(ROOT, "functions"), { recursive: true });
+  for (const [name, bytes] of EDGE_ARTIFACTS) {
+    writeFileSync(join(ROOT, name), bytes);
+  }
+}
 
 function firstDiffOffset(a, b) {
   const n = Math.min(a.length, b.length);
@@ -99,6 +133,29 @@ if (VERIFY_STAGED) {
   } catch (e) {
     auditIssues.push("cannot audit the git index: " + String((e && e.message) || e));
   }
+  for (const edgeSource of ["edgeone/eo-prelude.js", "edgeone/eo-entry.js", "edgeone/cf-pages-entry.js"]) {
+    const diskSource = existsSync(join(ROOT, edgeSource)) ? readFileSync(join(ROOT, edgeSource)) : null;
+    if (!diskSource) auditIssues.push(edgeSource + " is missing on disk — restore it before committing");
+    else {
+      try {
+        const stagedSource = execFileSync("git", ["show", ":" + edgeSource], { cwd: ROOT, maxBuffer: 16 * 1024 * 1024 });
+        if (Buffer.compare(stagedSource, diskSource) !== 0) auditIssues.push(edgeSource + " in the git index differs from the working tree — git add it before committing");
+      } catch (e) {
+        auditIssues.push(edgeSource + " is not in the git index — git add it before committing");
+      }
+    }
+  }
+  for (const [artifactName, artifactBytes] of EDGE_ARTIFACTS) {
+    const diskArtifact = existsSync(join(ROOT, artifactName)) ? readFileSync(join(ROOT, artifactName)) : null;
+    if (!diskArtifact) auditIssues.push(artifactName + " is missing on disk — run `node build.mjs --record` first");
+    else if (Buffer.compare(diskArtifact, artifactBytes) !== 0) auditIssues.push(artifactName + " on disk diverges from the current src/edgeone concat — stale: run `node build.mjs --record` first");
+    try {
+      const stagedArtifact = execFileSync("git", ["show", ":" + artifactName], { cwd: ROOT, maxBuffer: 16 * 1024 * 1024 });
+      if (Buffer.compare(stagedArtifact, artifactBytes) !== 0) auditIssues.push(artifactName + " in the git index differs from the audited bytes — git add it before committing");
+    } catch (e) {
+      auditIssues.push(artifactName + " is not in the git index — git add it before committing");
+    }
+  }
   const diskWorker = existsSync(workerPath) ? readFileSync(workerPath) : null;
   if (!diskWorker) auditIssues.push("worker.js is missing on disk");
   else if (Buffer.compare(diskWorker, assembled) !== 0) auditIssues.push("worker.js on disk diverges from the current src concat — stale: run `node build.mjs --record` first");
@@ -120,7 +177,7 @@ if (VERIFY_STAGED) {
     process.exit(1);
   }
   console.log(`build: node ${process.versions.node} (major-locked ${LOCKED_MAJOR}, baseline ${LOCKED_NODE_VERSION})`);
-  console.log(`build: VERIFY-STAGED — audited read-only: worker.js / golden/worker.head.mjs / build/out/worker.check.mjs are each byte-identical to the ${assembled.length}-byte src concat; syntax gate green; nothing was written.`);
+  console.log(`build: VERIFY-STAGED — audited read-only: worker.js / golden/worker.head.mjs / build/out/worker.check.mjs are each byte-identical to the ${assembled.length}-byte src concat; edge-functions/index.js / edge-functions/[[default]].js / functions/[[path]].js / functions/index.js are byte-identical to the src/edgeone concat; the edgeone/ sources are staged verbatim; syntax gate green; nothing was written.`);
   if (baseline && cmp === 0) {
     console.log("build: HEAD baseline is byte-equal as well — the staged state is commit-consistent.");
   } else {
@@ -146,6 +203,9 @@ try {
   process.exit(1);
 }
 
+checkEdgeSyntax();
+writeEdgeArtifacts();
+
 const goldenPath = join(ROOT, "golden", "worker.head.mjs");
 const goldenCurrent = existsSync(goldenPath) ? readFileSync(goldenPath) : null;
 const goldenDesynced = !goldenCurrent || Buffer.compare(goldenCurrent, assembled) !== 0;
@@ -169,7 +229,7 @@ if (baseline && cmp === 0) {
   }
 } else if (baseline) {
   console.log(
-    `build: RECORD MODE — artifacts rewritten from src/ (worker.js${wroteGolden ? ", golden/worker.head.mjs" : ""}, build/out/worker.check.mjs)`
+    `build: RECORD MODE — artifacts rewritten from src/ (worker.js${wroteGolden ? ", golden/worker.head.mjs" : ""}, build/out/worker.check.mjs, edge-functions/index.js, edge-functions/[[default]].js, functions/[[path]].js, functions/index.js)`
   );
   console.log(`build: ${partFiles.length} parts, ${assembled.length} bytes, drift vs git show HEAD:worker.js`);
   console.log(reportDiff(assembled, baseline));
