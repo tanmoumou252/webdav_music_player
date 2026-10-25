@@ -150,6 +150,7 @@ export function scenarios() {
       seedKV: seedAdmin(),
       request: {
         ...POST("/api/admin/login", { adminPass: F.ADMIN_PASS }),
+        cf: { colo: "TST" },
         headers: { "content-type": "application/json", "cf-connecting-ip": IP },
       },
       stub: null,
@@ -164,6 +165,7 @@ export function scenarios() {
       seedKV: seedAdmin(),
       request: {
         ...POST("/api/admin/login", { adminPass: "wrongpass" }),
+        cf: { colo: "TST" },
         headers: { "content-type": "application/json", "cf-connecting-ip": IP },
       },
       stub: null,
@@ -174,6 +176,7 @@ export function scenarios() {
       seedKV: seedAdmin({ [`rl_login_${IP}`]: "5" }),
       request: {
         ...POST("/api/admin/login", { adminPass: F.ADMIN_PASS }),
+        cf: { colo: "TST" },
         headers: { "content-type": "application/json", "cf-connecting-ip": IP },
       },
       stub: null,
@@ -184,6 +187,7 @@ export function scenarios() {
       seedKV: { admin_pass: "legacy1234" },
       request: {
         ...POST("/api/admin/login", { adminPass: "legacy1234" }),
+        cf: { colo: "TST" },
         headers: { "content-type": "application/json", "cf-connecting-ip": IP },
       },
       stub: null,
@@ -948,6 +952,7 @@ export async function runOne(scenario, worker) {
         });
     try {
       const req = makeRequest(scenario.request);
+      if (scenario.request.cf) req.cf = scenario.request.cf;
       const res = await worker.fetch(req, env);
       const headers = {};
       for (const [k, v] of res.headers.entries()) headers[k] = v;

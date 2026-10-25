@@ -123,12 +123,11 @@ function parseContentRangeTotal(value) {
   return Number.isFinite(total) && total >= 0 ? total : null;
 }
 
-function parseUpstreamTimeoutMs(raw) {
-  const FALLBACK = 8000;
+function parseUpstreamTimeoutMs(raw, fallbackMs) {
   const MIN = 500;
   const MAX = 300000;
   const n = typeof raw === "number" ? raw : (typeof raw === "string" && /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN);
-  if (!Number.isFinite(n) || n <= 0) return FALLBACK;
+  if (!Number.isFinite(n) || n <= 0) return typeof fallbackMs === "number" && fallbackMs > 0 ? fallbackMs : 8000;
   if (n < MIN) return MIN;
   if (n > MAX) return MAX;
   return n;

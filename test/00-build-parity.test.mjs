@@ -24,7 +24,7 @@ test("Tier-4 byte parity: committed worker.js == src concat (self-skips while ar
   const partFiles = readdirSync(join(ROOT, "src"))
     .filter((f) => f.endsWith(".part.js"))
     .sort();
-  assert.equal(partFiles.length, 7, "expected 7 parts");
+  assert.equal(partFiles.length, 8, "expected 8 parts");
   const stitched = Buffer.concat(partFiles.map((f) => readFileSync(join(ROOT, "src", f))));
   const head = execFileSync("git", ["show", "HEAD:worker.js"], { cwd: ROOT, maxBuffer: 16 * 1024 * 1024 });
   assert.equal(stitched.length, head.length, "byte length drift");
