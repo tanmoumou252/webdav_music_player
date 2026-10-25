@@ -117,14 +117,11 @@ test("eo adapter ttl envelope: put wraps {w,k,e,v}, expired reads null, e=0 neve
   assert.ok(Math.abs(envelope.e - (before + 600000)) < 5000, "envelope expiry is now+ttl*1000");
   assert.equal(await kv.get("rl_login_9.9.9.9"), "3", "unexpired text read returns the value");
   raw.store.set(storedKey, JSON.stringify({ w: 1, k: storedKey, e: Date.now() - 1, v: "9" }));
+  let expiryDeletes = 0;
+  raw.delete = async () => { expiryDeletes += 1; };
   assert.equal(await kv.get("rl_login_9.9.9.9"), null, "expired envelope reads as missing");
-  assert.equal(raw.store.has(storedKey), false, "an expired envelope entry is best-effort deleted from the raw KV, not left to leak quota");
-  const failingRaw = eoRawKvStub();
-  const failingKv = A.eoWrapKV(failingRaw);
-  const failKey = A.eoMangleKey("rl_login_5.6.7.8");
-  failingRaw.store.set(failKey, JSON.stringify({ w: 1, k: failKey, e: Date.now() - 1, v: "9" }));
-  failingRaw.delete = async () => { throw new Error("delete down"); };
-  assert.equal(await failingKv.get("rl_login_5.6.7.8"), null, "a failing expiry delete must not change the read: still null");
+  assert.equal(expiryDeletes, 0, "an expired envelope read must never delete the raw key — a concurrent fresh put between get and delete would be clobbered (KV has no atomic CAS)");
+  assert.equal(raw.store.has(storedKey), true, "the expired entry stays in place for the next put to overwrite");
   raw.store.set(storedKey, JSON.stringify({ w: 1, k: storedKey, e: 0, v: "5" }));
   assert.equal(await kv.get("rl_login_9.9.9.9"), "5", "e=0 never expires");
 });

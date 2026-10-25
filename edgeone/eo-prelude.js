@@ -28,7 +28,6 @@ function eoWrapKV(raw) {
       const isEnvelope = parsed && parsed.w === 1 && typeof parsed.v === "string" && typeof parsed.e === "number" && parsed.k === eoMangleKey(key);
       if (isEnvelope) {
         if (parsed.e > 0 && Date.now() > parsed.e) {
-          try { await raw.delete(eoMangleKey(key)); } catch (e) {}
           return null;
         }
         if (!wantJson) return parsed.v;
